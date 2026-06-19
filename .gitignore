@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+~$*.xlsx
+build/
+dist/
+Mac免安装交付包/
+Windows免安装交付包/
+*.zip
+tools/cloudflared
+backups/

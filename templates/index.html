@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>企业采购仓库销售管理系统</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">采购仓库销售系统</div>
+    <button class="nav active" data-view="dashboard">首页仪表盘</button>
+    <button class="nav" data-view="suppliers">供应商管理</button>
+    <button class="nav" data-view="customers">客户管理</button>
+    <button class="nav" data-view="products">产品管理</button>
+    <button class="nav" data-view="purchases">采购管理</button>
+    <button class="nav" data-view="sales">销售管理</button>
+    <button class="nav" data-view="stock">库存管理</button>
+    <button class="nav" data-view="stats">统计分析</button>
+    <button class="nav admin-only" data-view="users">用户管理</button>
+    <button class="nav admin-only" data-view="logs">系统日志</button>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="pageTitle">首页仪表盘</h1>
+        <p id="pageSubTitle">查看关键数据和库存预警</p>
+      </div>
+      <div class="user-box">
+        <span id="currentUser">{{ user.display_name }}（{{ user.role }}）</span>
+        <button id="backupBtn" class="admin-only">备份数据库</button>
+        <button id="logoutBtn">退出</button>
+      </div>
+    </header>
+
+    <section id="message" class="message"></section>
+    <section id="content"></section>
+  </main>
+
+  <template id="toolbarTemplate">
+    <div class="toolbar">
+      <input class="search" placeholder="输入关键字查询">
+      <button class="searchBtn">查询</button>
+      <button class="newBtn primary">新增</button>
+      <button class="exportBtn">导出CSV</button>
+    </div>
+  </template>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-panel">
+      <div class="modal-head">
+        <h2 id="modalTitle"></h2>
+        <button id="closeModal">×</button>
+      </div>
+      <form id="modalForm" class="form-grid"></form>
+    </div>
+  </div>
+
+  <script>
+    window.APP_USER = {{ user|tojson }};
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

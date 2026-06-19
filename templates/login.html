@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>企业采购仓库销售管理系统 - 登录</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-page">
+  <main class="login-box">
+    <h1>企业采购仓库销售管理系统</h1>
+    <p>局域网轻量版 V1.0</p>
+    <form id="loginForm">
+      <label>用户名<input name="username" value="admin" required></label>
+      <label>密码<input name="password" type="password" value="admin123" required></label>
+      <button type="submit">登录</button>
+    </form>
+    <div class="hint">默认管理员：admin / admin123；普通用户：user / user123</div>
+    <div id="loginMessage" class="message"></div>
+  </main>
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = new FormData(event.target);
+      const response = await fetch('/api/login', { method: 'POST', body: form });
+      const result = await response.json();
+      if (result.ok) {
+        location.href = '/';
+      } else {
+        document.getElementById('loginMessage').textContent = result.message || '登录失败';
+      }
+    });
+  </script>
+</body>
+</html>
