@@ -270,6 +270,7 @@ function renderRows(view, rows) {
 async function renderOrders(view) {
   await refreshLookups();
   const data = await api(`/api/${view}`);
+  const quotationData = view === 'sales' ? await api('/api/quotations') : null;
   data.items.forEach(row => {
     const statusMap = { pending: '待处理', partial: view === 'purchases' ? '部分到货' : '部分发货', completed: '已完成', cancelled: '已作废' };
     row.status_text = `${statusMap[row.status] || row.status}${row.overdue ? '（已逾期）' : ''}`;
@@ -280,7 +281,15 @@ async function renderOrders(view) {
     content.insertAdjacentHTML('beforeend', `<div class="panel"><strong>模板对应：</strong>${templateNotes[view]}</div>`);
   }
   const toolbar = mountToolbar(view);
+  toolbar.querySelector('.newBtn').textContent = view === 'purchases' ? '新增采购单' : '新增销售单';
   toolbar.querySelector('.newBtn').onclick = () => openOrderForm(view);
+  if (view === 'sales') {
+    const quoteButton = document.createElement('button');
+    quoteButton.className = 'primary';
+    quoteButton.textContent = '新增报价单';
+    quoteButton.onclick = () => openQuotationForm(null, quotationData.default_company_name);
+    toolbar.querySelector('.newBtn').insertAdjacentElement('afterend', quoteButton);
+  }
   toolbar.querySelector('.searchBtn').onclick = async () => {
     const result = await api(`/api/${view}?q=${encodeURIComponent(toolbar.querySelector('.search').value)}`);
     result.items.forEach(row => {
@@ -303,6 +312,34 @@ async function renderOrders(view) {
   }
   content.insertAdjacentHTML('beforeend', '<div id="orderTableHolder"></div>');
   renderOrderTable(view, data.items);
+  if (view === 'sales') renderQuotationPanel(quotationData);
+}
+
+function renderQuotationPanel(data) {
+  $('#content').insertAdjacentHTML('beforeend', `
+    <section class="quotation-section">
+      <div class="section-head"><div><h2>报价单</h2><p>报价单不会扣减库存，可编辑、查询和打印。</p></div>
+        <div class="toolbar quotation-search"><input id="quotationSearch" placeholder="报价单号、客户或发货单位"><button id="quotationSearchBtn">查询报价单</button></div>
+      </div>
+      <div id="quotationTableHolder"></div>
+    </section>`);
+  renderQuotationTable(data.items, data.default_company_name);
+  $('#quotationSearchBtn').onclick = async () => {
+    const result = await api(`/api/quotations?q=${encodeURIComponent($('#quotationSearch').value)}`);
+    renderQuotationTable(result.items, result.default_company_name);
+  };
+}
+
+function renderQuotationTable(rows, defaultCompanyName = '') {
+  const cols = [
+    ['quote_no','报价单号'],['quote_date','报价日期'],['customer_name','客户'],['shipping_unit','发货单位'],
+    ['delivery_date','交货日期'],['item_count','备件项数'],['total_quantity','数量'],['amount','报价总额']
+  ];
+  $('#quotationTableHolder').innerHTML = tableHtml(cols, rows, { actions: row => `
+    <button onclick='viewQuotation(${JSON.stringify(row)})'>查看</button>
+    ${canEditBase() ? `<button onclick='openQuotationForm(${JSON.stringify(row)}, ${JSON.stringify(defaultCompanyName)})'>修改</button>` : ''}
+    <button class="primary" onclick='printQuotation(${JSON.stringify(row)})'>打印报价单</button>
+    ${canEditBase() ? `<button class="danger" onclick='deleteQuotation(${row.id})'>删除</button>` : ''}` });
 }
 
 function renderOrderTable(view, rows) {
@@ -406,6 +443,107 @@ async function saveOrder(event, view, row) {
     });
     closeModal();
     showMessage(`整单保存成功，单号：${result.order_no}`, true);
+    await loadView();
+  } catch (error) { showMessage(error.message); }
+}
+
+async function openQuotationForm(row = null, defaultCompanyName = '') {
+  await refreshLookups();
+  const today = new Date().toISOString().slice(0, 10);
+  const validDate = new Date();
+  validDate.setDate(validDate.getDate() + 30);
+  $('#modalTitle').textContent = row ? `修改报价单 ${row.quote_no}` : '新增报价单';
+  const form = $('#modalForm');
+  form.innerHTML = `
+    <label>报价单号<input name="quote_no" value="${row?.quote_no || ''}" placeholder="留空自动生成"></label>
+    <label>我方公司名称<input name="own_company_name" value="${row?.own_company_name || defaultCompanyName || ''}" required></label>
+    <label>客户<select name="customer_id" required><option value="">请选择</option>${orderPartyOptions('sales', row?.customer_id)}</select></label>
+    <label>发货单位<input name="shipping_unit" value="${row?.shipping_unit || ''}" required></label>
+    <label>报价日期<input name="quote_date" type="date" value="${row?.quote_date || today}" required></label>
+    <label>报价有效期至<input name="validity_date" type="date" value="${row?.validity_date || validDate.toISOString().slice(0, 10)}"></label>
+    <label>收货联系人<input name="shipping_contact" value="${row?.shipping_contact || ''}"></label>
+    <label>联系电话<input name="shipping_phone" value="${row?.shipping_phone || ''}"></label>
+    <label class="wide">发货/收货地址<input name="shipping_address" value="${row?.shipping_address || ''}"></label>
+    <label>预计交货日期<input name="delivery_date" type="date" value="${row?.delivery_date || ''}"></label>
+    <label>发货方式<input name="delivery_method" value="${row?.delivery_method || ''}" placeholder="例如：快递、物流、自提"></label>
+    <label class="wide">报价及发货备注<textarea name="remark">${row?.remark || ''}</textarea></label>
+    <div class="wide order-lines-head"><h3>报价明细</h3><button type="button" id="addOrderLine" class="primary">增加备件</button></div>
+    <div id="orderLines" class="wide order-lines"></div>
+    <div class="wide order-total">报价合计：<strong id="orderTotal">0.00</strong></div>
+    <div class="form-actions"><button type="button" id="cancelBtn">取消</button><button class="primary" type="submit">保存报价单</button></div>`;
+  $('#modal').classList.remove('hidden');
+  $('#cancelBtn').onclick = closeModal;
+  $('#addOrderLine').onclick = () => addOrderLine('sales');
+  (row?.items?.length ? row.items : [{}]).forEach(item => addOrderLine('sales', item));
+  const customerSelect = form.elements.customer_id;
+  customerSelect.onchange = () => {
+    const customer = state.customers.find(item => Number(item.id) === Number(customerSelect.value));
+    if (!customer) return;
+    if (!form.elements.shipping_unit.value) form.elements.shipping_unit.value = customer.name || '';
+    if (!form.elements.shipping_contact.value) form.elements.shipping_contact.value = customer.contact || '';
+    if (!form.elements.shipping_phone.value) form.elements.shipping_phone.value = customer.phone || '';
+    if (!form.elements.shipping_address.value) form.elements.shipping_address.value = customer.address || '';
+  };
+  form.onsubmit = event => saveQuotation(event, row);
+}
+
+async function saveQuotation(event, row) {
+  event.preventDefault();
+  const form = event.target;
+  const data = Object.fromEntries(new FormData(form));
+  data.items = Array.from(form.querySelectorAll('.order-line')).map(line => ({
+    product_id: line.querySelector('.line-product').value,
+    quantity: line.querySelector('.line-quantity').value,
+    unit_price: line.querySelector('.line-price').value,
+    remark: line.querySelector('.line-remark').value,
+  }));
+  try {
+    const result = await api(row ? `/api/quotations/${row.id}` : '/api/quotations', {
+      method: row ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    });
+    closeModal();
+    showMessage(`报价单保存成功：${result.quote_no}`, true);
+    await loadView();
+  } catch (error) { showMessage(error.message); }
+}
+
+function quotationItemsTable(row) {
+  return `<div class="table-wrap"><table class="detail-table"><thead><tr><th>序号</th><th>备件编号</th><th>产品名称</th><th>技术描述</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>备注</th></tr></thead><tbody>${row.items.map((item, index) => `<tr><td>${index + 1}</td><td>${item.product_code}</td><td>${item.product_name}</td><td>${item.description || ''}</td><td>${item.unit || ''}</td><td>${item.quantity}</td><td>${money(item.unit_price)}</td><td>${money(item.amount)}</td><td>${item.remark || ''}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function viewQuotation(row) {
+  $('#modalTitle').textContent = `报价单 ${row.quote_no}`;
+  $('#modalForm').innerHTML = `
+    <div class="wide order-summary"><strong>${row.own_company_name}</strong><span>客户：${row.customer_name}</span><span>报价日期：${row.quote_date}</span><span>有效期至：${row.validity_date || '-'}</span></div>
+    <div class="wide shipping-summary"><strong>发货信息</strong><span>发货单位：${row.shipping_unit}</span><span>联系人：${row.shipping_contact || '-'}</span><span>电话：${row.shipping_phone || '-'}</span><span>地址：${row.shipping_address || '-'}</span><span>交货日期：${row.delivery_date || '-'}</span><span>方式：${row.delivery_method || '-'}</span></div>
+    <div class="wide">${quotationItemsTable(row)}</div>
+    <div class="wide order-total">报价合计：<strong>${money(row.amount)}</strong></div>
+    <div class="form-actions"><button type="button" id="cancelBtn">关闭</button><button type="button" class="primary" id="printQuoteBtn">打印报价单</button></div>`;
+  $('#modal').classList.remove('hidden');
+  $('#cancelBtn').onclick = closeModal;
+  $('#printQuoteBtn').onclick = () => printQuotation(row);
+}
+
+function printQuotation(row) {
+  const itemRows = row.items.map((item, index) => `<tr><td>${index + 1}</td><td>${item.product_code}</td><td>${item.product_name}</td><td>${item.description || ''}</td><td>${item.unit || ''}</td><td>${item.quantity}</td><td>${money(item.unit_price)}</td><td>${money(item.amount)}</td><td>${item.remark || ''}</td></tr>`).join('');
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>报价单 ${row.quote_no}</title><style>
+    @page{size:A4;margin:16mm}body{font-family:Arial,"Microsoft YaHei",sans-serif;color:#111;font-size:13px;margin:0}h1{text-align:center;font-size:26px;margin:4px 0}.company{text-align:center;font-size:18px;font-weight:700;margin-bottom:18px}.meta,.shipping{display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;margin:12px 0;padding:10px;border:1px solid #777}.shipping h2{grid-column:1/-1;font-size:15px;margin:0 0 4px}.wide{grid-column:1/-1}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border:1px solid #555;padding:7px;text-align:left}th{background:#f0f0f0}.number{text-align:right}.total{text-align:right;font-size:17px;font-weight:700;margin:14px 0}.remark{min-height:48px;border:1px solid #777;padding:9px}.footer{display:flex;justify-content:space-between;margin-top:34px}@media print{button{display:none}}
+  </style></head><body><h1>报 价 单</h1><div class="company">${row.own_company_name}</div>
+  <div class="meta"><span>报价单号：${row.quote_no}</span><span>报价日期：${row.quote_date}</span><span>客户名称：${row.customer_name}</span><span>报价有效期至：${row.validity_date || '-'}</span></div>
+  <div class="shipping"><h2>基础发货信息</h2><span>发货单位：${row.shipping_unit}</span><span>收货联系人：${row.shipping_contact || '-'}</span><span>联系电话：${row.shipping_phone || '-'}</span><span>预计交货日期：${row.delivery_date || '-'}</span><span class="wide">发货/收货地址：${row.shipping_address || '-'}</span><span>发货方式：${row.delivery_method || '-'}</span></div>
+  <table><thead><tr><th>序号</th><th>备件编号</th><th>产品名称</th><th>技术描述</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>备注</th></tr></thead><tbody>${itemRows}</tbody></table>
+  <div class="total">报价总金额：￥${money(row.amount)}</div><div class="remark"><strong>报价及发货备注：</strong>${row.remark || '无'}</div>
+  <div class="footer"><span>报价人：${row.created_by || ''}</span><span>客户确认：________________</span></div><script>window.print()</script></body></html>`;
+  const win = window.open('', '_blank');
+  win.document.write(html);
+  win.document.close();
+}
+
+async function deleteQuotation(id) {
+  if (!confirm('确认删除这张报价单吗？')) return;
+  try {
+    await api(`/api/quotations/${id}`, { method: 'DELETE' });
+    showMessage('报价单已删除', true);
     await loadView();
   } catch (error) { showMessage(error.message); }
 }
