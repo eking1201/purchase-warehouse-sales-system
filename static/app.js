@@ -392,7 +392,7 @@ function renderDeliveryTable(rows) {
 }
 
 function openDeliveryOrderPicker(orders) {
-  const available = orders.filter(row => !['completed', 'cancelled'].includes(row.status));
+  const available = orders.filter(row => !['completed', 'cancelled'].includes(row.status) && !row.draft_delivery_note_id);
   $('#modalTitle').textContent = '新增发货单';
   $('#modalForm').innerHTML = `<label class="wide">选择销售订单<select name="sales_order_id" required><option value="">请选择</option>${available.map(row => `<option value="${row.id}">${row.order_no} - ${row.customer_name}（未发 ${Number(row.total_quantity) - Number(row.processed_quantity)}）</option>`).join('')}</select></label><div class="form-actions"><button type="button" id="cancelBtn">取消</button><button type="submit" class="primary">下一步</button></div>`;
   $('#modal').classList.remove('hidden');
@@ -402,6 +402,15 @@ function openDeliveryOrderPicker(orders) {
     const order = available.find(item => Number(item.id) === Number(event.target.elements.sales_order_id.value));
     if (order) openDeliveryForm(order);
   };
+}
+
+async function openExistingDeliveryNote(noteId) {
+  try {
+    const result = await api('/api/delivery-notes');
+    const note = result.items.find(item => Number(item.id) === Number(noteId));
+    if (!note) throw new Error('待确认发货单不存在，请刷新页面后重试');
+    viewDeliveryNote(note);
+  } catch (error) { showMessage(error.message); }
 }
 
 async function openDeliveryForm(order) {
@@ -483,7 +492,9 @@ function renderOrderTable(view, rows) {
       ${row.status === 'pending' && canEditBase() ? `<button onclick='openOrderForm("${view}", ${JSON.stringify(row)})'>修改</button>` : ''}
       ${!['completed', 'cancelled'].includes(row.status) ? (view === 'purchases'
         ? `<button class="primary" onclick='openProgressForm("${view}", ${JSON.stringify(row)})'>确认到货</button>`
-        : `<button class="primary" onclick='openDeliveryForm(${JSON.stringify(row)})'>生成发货单</button>`) : ''}
+        : (row.draft_delivery_note_id
+          ? `<button class="primary" onclick='openExistingDeliveryNote(${row.draft_delivery_note_id})'>查看待确认发货单</button>`
+          : `<button class="primary" onclick='openDeliveryForm(${JSON.stringify(row)})'>生成发货单</button>`)) : ''}
       <button onclick='printOrder("${view}", ${JSON.stringify(row)})'>打印</button>
     `
   });
@@ -777,7 +788,11 @@ function stockOrderTable(view, rows) {
   const cols = isPurchase
     ? [['order_no','采购单号'],['supplier_name','供应商'],['expected_date','要求到货日期'],['total_quantity','总数量'],['processed_quantity','已到货'],['status_text','状态']]
     : [['order_no','销售单号'],['customer_name','客户'],['delivery_date','要求发货日期'],['total_quantity','总数量'],['processed_quantity','已发货'],['status_text','状态']];
-  return tableHtml(cols, rows, { actions: row => `<button onclick='viewOrder("${view}", ${JSON.stringify(row)})'>查看明细</button><button class="primary" onclick='${isPurchase ? `openProgressForm("${view}", ${JSON.stringify(row)})` : `openDeliveryForm(${JSON.stringify(row)})`}'>${isPurchase ? '确认到货' : '生成发货单'}</button>` });
+  return tableHtml(cols, rows, { actions: row => `<button onclick='viewOrder("${view}", ${JSON.stringify(row)})'>查看明细</button>${isPurchase
+    ? `<button class="primary" onclick='openProgressForm("${view}", ${JSON.stringify(row)})'>确认到货</button>`
+    : (row.draft_delivery_note_id
+      ? `<button class="primary" onclick='openExistingDeliveryNote(${row.draft_delivery_note_id})'>查看待确认发货单</button>`
+      : `<button class="primary" onclick='openDeliveryForm(${JSON.stringify(row)})'>生成发货单</button>`)}` });
 }
 
 async function renderStats() {
@@ -1013,23 +1028,32 @@ async function openSupplierAttachments(supplierId, supplierName) {
   try {
     const result = await api(`/api/suppliers/${supplierId}/attachments`);
     $('#modalTitle').textContent = `${supplierName} - 附件`;
-    const rows = result.items.map(item => `
+    const rows = result.items.map(item => {
+      const type = String(item.file_type || '').toLowerCase();
+      const isImage = ['jpg', 'jpeg', 'png'].includes(type);
+      const canPreview = isImage || type === 'pdf';
+      const preview = isImage
+        ? `<button type="button" class="attachment-thumb-button" onclick='openAttachmentPreview(${item.id}, ${JSON.stringify(item.file_name)}, ${JSON.stringify(type)})'><img class="attachment-thumb" src="/api/attachments/${item.id}/view" alt="${item.file_name}"></button>`
+        : (type === 'pdf' ? '<span class="file-badge">PDF</span>' : `<span class="file-badge">${type.toUpperCase() || '文件'}</span>`);
+      return `
       <tr>
+        <td>${preview}</td>
         <td>${item.file_name}</td>
         <td>${item.file_type || ''}</td>
         <td>${item.uploaded_at}</td>
         <td>
+          ${canPreview ? `<button type="button" onclick='openAttachmentPreview(${item.id}, ${JSON.stringify(item.file_name)}, ${JSON.stringify(type)})'>${isImage ? '查看/放大' : '预览'}</button>` : ''}
           <button type="button" onclick="location.href='/api/attachments/${item.id}/download'">下载</button>
-          ${state.user.role === 'admin' ? `<button type="button" onclick="deleteSupplierAttachment(${item.id}, ${supplierId}, ${JSON.stringify(supplierName)})">删除</button>` : ''}
+          ${window.APP_USER.role === 'admin' ? `<button class="danger" type="button" onclick="deleteSupplierAttachment(${item.id}, ${supplierId}, ${JSON.stringify(supplierName)})">删除</button>` : ''}
         </td>
       </tr>
-    `).join('');
+    `}).join('');
     $('#modalForm').innerHTML = `
       <div class="wide">
         <div class="table-wrap">
           <table>
-            <thead><tr><th>文件名</th><th>类型</th><th>上传时间</th><th>操作</th></tr></thead>
-            <tbody>${rows || '<tr><td colspan="4">暂无附件</td></tr>'}</tbody>
+            <thead><tr><th>预览</th><th>文件名</th><th>类型</th><th>上传时间</th><th>操作</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="5">暂无附件</td></tr>'}</tbody>
           </table>
         </div>
       </div>
@@ -1056,6 +1080,35 @@ async function openSupplierAttachments(supplierId, supplierName) {
   } catch (error) {
     showMessage(error.message);
   }
+}
+
+function openAttachmentPreview(attachmentId, fileName, fileType) {
+  let layer = $('#attachmentPreview');
+  if (!layer) {
+    document.body.insertAdjacentHTML('beforeend', `
+      <div id="attachmentPreview" class="attachment-preview hidden">
+        <div class="attachment-preview-panel">
+          <div class="attachment-preview-head"><strong id="attachmentPreviewTitle"></strong><button type="button" id="closeAttachmentPreview" title="关闭">×</button></div>
+          <div id="attachmentPreviewBody" class="attachment-preview-body"></div>
+        </div>
+      </div>`);
+    layer = $('#attachmentPreview');
+    $('#closeAttachmentPreview').onclick = closeAttachmentPreview;
+    layer.onclick = event => { if (event.target === layer) closeAttachmentPreview(); };
+  }
+  $('#attachmentPreviewTitle').textContent = fileName;
+  const url = `/api/attachments/${attachmentId}/view`;
+  $('#attachmentPreviewBody').innerHTML = fileType === 'pdf'
+    ? `<iframe class="attachment-pdf" src="${url}" title="${fileName}"></iframe>`
+    : `<img class="attachment-full-image" src="${url}" alt="${fileName}">`;
+  layer.classList.remove('hidden');
+}
+
+function closeAttachmentPreview() {
+  const layer = $('#attachmentPreview');
+  if (!layer) return;
+  layer.classList.add('hidden');
+  $('#attachmentPreviewBody').innerHTML = '';
 }
 
 async function deleteSupplierAttachment(attachmentId, supplierId, supplierName) {

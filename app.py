@@ -998,6 +998,23 @@ def attachment_download(attachment_id: int):
     return send_file(target, as_attachment=True, download_name=attachment["file_name"])
 
 
+@app.get("/api/attachments/<int:attachment_id>/view")
+@login_required
+def attachment_view(attachment_id: int):
+    """图片和 PDF 在浏览器内预览，其他办公文件继续使用下载方式。"""
+    with db() as conn:
+        attachment = conn.execute("SELECT * FROM supplier_attachments WHERE id=?", (attachment_id,)).fetchone()
+    if not attachment:
+        return jsonify({"ok": False, "message": "附件不存在"}), 404
+    file_type = (attachment["file_type"] or "").lower()
+    if file_type not in {"jpg", "jpeg", "png", "pdf"}:
+        return jsonify({"ok": False, "message": "该文件类型不支持直接预览，请下载后查看"}), 400
+    target = (WRITE_DIR / attachment["file_path"]).resolve()
+    if not target.exists() or WRITE_DIR.resolve() not in target.parents:
+        return jsonify({"ok": False, "message": "附件文件不存在"}), 404
+    return send_file(target, as_attachment=False, download_name=attachment["file_name"])
+
+
 @app.delete("/api/attachments/<int:attachment_id>")
 @admin_required
 def attachment_delete(attachment_id: int):
@@ -1656,6 +1673,8 @@ def sales_headers_list():
                    COUNT(soi.id) AS item_count, COALESCE(SUM(soi.quantity),0) AS total_quantity,
                    COALESCE(SUM(soi.shipped_quantity),0) AS processed_quantity,
                    COALESCE(SUM(soi.amount),0) AS amount,
+                   (SELECT dn.id FROM delivery_notes dn WHERE dn.sales_order_id=soh.id AND dn.status='draft' ORDER BY dn.id DESC LIMIT 1) AS draft_delivery_note_id,
+                   (SELECT dn.note_no FROM delivery_notes dn WHERE dn.sales_order_id=soh.id AND dn.status='draft' ORDER BY dn.id DESC LIMIT 1) AS draft_delivery_note_no,
                    CASE WHEN soh.status NOT IN ('completed','cancelled') AND soh.delivery_date!=''
                              AND date(soh.delivery_date) < date('now','localtime') THEN 1 ELSE 0 END AS overdue
             FROM sales_order_headers soh
