@@ -882,6 +882,8 @@ def suppliers_create():
     data = payload()
     if not (data.get("name") or "").strip():
         return jsonify({"ok": False, "message": "供应商名称必填"}), 400
+    document_file_name = request.files.get("document").filename if request.files.get("document") else ""
+    photo_file_name = request.files.get("photo").filename if request.files.get("photo") else ""
     try:
         document_path = save_upload("document", "suppliers")
         photo_path = save_upload("photo", "suppliers")
@@ -901,7 +903,12 @@ def suppliers_create():
         if document_path:
             conn.execute(
                 "INSERT INTO supplier_attachments (supplier_id,file_name,file_path,file_type,uploaded_at) VALUES (?,?,?,?,?)",
-                (supplier_id, Path(document_path).name, document_path, Path(document_path).suffix.lstrip("."), now_text()),
+                (supplier_id, document_file_name or Path(document_path).name, document_path, Path(document_path).suffix.lstrip("."), now_text()),
+            )
+        if photo_path:
+            conn.execute(
+                "INSERT INTO supplier_attachments (supplier_id,file_name,file_path,file_type,uploaded_at) VALUES (?,?,?,?,?)",
+                (supplier_id, photo_file_name or Path(photo_path).name, photo_path, Path(photo_path).suffix.lstrip("."), now_text()),
             )
         for attachment in attachments:
             conn.execute(
@@ -917,15 +924,40 @@ def suppliers_create():
 def suppliers_update(item_id: int):
     data = payload()
     with db() as conn:
+        if not conn.execute("SELECT id FROM suppliers WHERE id=?", (item_id,)).fetchone():
+            return jsonify({"ok": False, "message": "供应商不存在"}), 404
+    document_file_name = request.files.get("document").filename if request.files.get("document") else ""
+    photo_file_name = request.files.get("photo").filename if request.files.get("photo") else ""
+    try:
+        document_path = save_upload("document", "suppliers")
+        photo_path = save_upload("photo", "suppliers")
+        attachments = save_uploads("attachments", "suppliers")
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+    with db() as conn:
         conn.execute(
             """
-            UPDATE suppliers SET name=?,level=?,contact=?,phone=?,address=?,account_info=?,company_type=?,settlement=?,remark=?,updated_at=?
+            UPDATE suppliers SET name=?,level=?,contact=?,phone=?,address=?,account_info=?,company_type=?,settlement=?,
+            document_path=COALESCE(?,document_path),photo_path=COALESCE(?,photo_path),remark=?,updated_at=?
             WHERE id=?
             """,
-            (data.get("name"), data.get("level"), data.get("contact"), data.get("phone"), data.get("address"), data.get("account_info"), data.get("company_type"), data.get("settlement"), data.get("remark"), now_text(), item_id),
+            (data.get("name"), data.get("level"), data.get("contact"), data.get("phone"), data.get("address"), data.get("account_info"), data.get("company_type"), data.get("settlement"), document_path, photo_path, data.get("remark"), now_text(), item_id),
         )
+        linked_files = []
+        if document_path:
+            linked_files.append({"file_name": document_file_name or Path(document_path).name, "file_path": document_path,
+                                 "file_type": Path(document_path).suffix.lstrip(".")})
+        if photo_path:
+            linked_files.append({"file_name": photo_file_name or Path(photo_path).name, "file_path": photo_path,
+                                 "file_type": Path(photo_path).suffix.lstrip(".")})
+        linked_files.extend(attachments)
+        for attachment in linked_files:
+            conn.execute(
+                "INSERT INTO supplier_attachments (supplier_id,file_name,file_path,file_type,uploaded_at) VALUES (?,?,?,?,?)",
+                (item_id, attachment["file_name"], attachment["file_path"], attachment["file_type"], now_text()),
+            )
     log_action("修改供应商", f"ID {item_id}")
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "attachment_count": len(linked_files)})
 
 
 @app.delete("/api/suppliers/<int:item_id>")
