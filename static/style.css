@@ -375,6 +375,15 @@ tr:hover td {
   background: #f8fafc;
 }
 
+.form-section-title {
+  margin-top: 4px;
+  padding: 9px 10px;
+  border-left: 4px solid var(--blue);
+  background: #eef3f8;
+  font-size: 16px;
+  font-weight: 700;
+}
+
 @media (max-width: 1100px) {
   .order-line {
     grid-template-columns: repeat(3, minmax(130px, 1fr));

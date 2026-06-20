@@ -329,6 +329,7 @@ def execute_schema() -> None:
                 shipping_unit TEXT NOT NULL,
                 shipping_contact TEXT,
                 shipping_phone TEXT,
+                sender_address TEXT,
                 shipping_address TEXT,
                 delivery_date TEXT,
                 delivery_method TEXT,
@@ -349,6 +350,39 @@ def execute_schema() -> None:
                 amount REAL NOT NULL,
                 remark TEXT,
                 FOREIGN KEY(quotation_id) REFERENCES quotations(id) ON DELETE CASCADE,
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS delivery_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_no TEXT NOT NULL UNIQUE,
+                sales_order_id INTEGER NOT NULL,
+                delivery_date TEXT NOT NULL,
+                shipping_unit TEXT NOT NULL,
+                sender_address TEXT,
+                receiving_unit TEXT NOT NULL,
+                receiver_contact TEXT,
+                receiver_phone TEXT,
+                receiver_address TEXT,
+                delivery_method TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                remark TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                FOREIGN KEY(sales_order_id) REFERENCES sales_order_headers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS delivery_note_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_note_id INTEGER NOT NULL,
+                sales_order_item_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity REAL NOT NULL,
+                remark TEXT,
+                FOREIGN KEY(delivery_note_id) REFERENCES delivery_notes(id) ON DELETE CASCADE,
+                FOREIGN KEY(sales_order_item_id) REFERENCES sales_order_items(id),
                 FOREIGN KEY(product_id) REFERENCES products(id)
             );
 
@@ -377,6 +411,9 @@ def execute_schema() -> None:
         sales_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sales_orders)")}
         if "status" not in sales_columns:
             conn.execute("ALTER TABLE sales_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'")
+        quotation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(quotations)")}
+        if "sender_address" not in quotation_columns:
+            conn.execute("ALTER TABLE quotations ADD COLUMN sender_address TEXT")
         migrate_legacy_orders(conn)
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             conn.execute(
@@ -1093,9 +1130,10 @@ def products_delete(item_id: int):
               (SELECT COUNT(*) FROM purchase_order_items WHERE product_id=?) +
               (SELECT COUNT(*) FROM sales_order_items WHERE product_id=?) +
               (SELECT COUNT(*) FROM quotation_items WHERE product_id=?) +
+              (SELECT COUNT(*) FROM delivery_note_items WHERE product_id=?) +
               (SELECT COUNT(*) FROM stock_movements WHERE product_id=?)
             """,
-            (item_id, item_id, item_id, item_id, item_id, item_id),
+            (item_id, item_id, item_id, item_id, item_id, item_id, item_id),
         ).fetchone()[0]
         if used:
             return jsonify({"ok": False, "message": "该产品已有订单或库存流水，不能删除；建议保留资料或后续增加停用功能"}), 400
@@ -1683,6 +1721,8 @@ def sales_header_update(order_id: int):
             return jsonify({"ok": False, "message": "销售单不存在"}), 404
         if order["status"] != "pending":
             return jsonify({"ok": False, "message": "已经开始发货的销售单不能修改明细"}), 400
+        if conn.execute("SELECT 1 FROM delivery_notes WHERE sales_order_id=?", (order_id,)).fetchone():
+            return jsonify({"ok": False, "message": "该销售单已经生成发货单，不能再修改订单明细"}), 400
         customer = conn.execute("SELECT id FROM customers WHERE id=?", (data.get("customer_id"),)).fetchone()
         if not customer:
             return jsonify({"ok": False, "message": "请选择客户"}), 400
@@ -1714,6 +1754,7 @@ def sales_header_update(order_id: int):
 @app.post("/api/sales/<int:order_id>/ship")
 @login_required
 def sales_ship(order_id: int):
+    return jsonify({"ok": False, "message": "请先生成发货单，再通过发货单确认扣减库存"}), 400
     data = payload()
     entries = data.get("items") or []
     user = current_user()
@@ -1802,8 +1843,12 @@ def quotations_list():
         default_company_name = conn.execute(
             "SELECT own_company_name FROM quotations WHERE own_company_name!='' ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        default_sender_address = conn.execute(
+            "SELECT sender_address FROM quotations WHERE sender_address IS NOT NULL AND sender_address!='' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
     return jsonify({"ok": True, "items": rows,
-                    "default_company_name": default_company_name[0] if default_company_name else ""})
+                    "default_company_name": default_company_name[0] if default_company_name else "",
+                    "default_sender_address": default_sender_address[0] if default_sender_address else ""})
 
 
 @app.post("/api/quotations")
@@ -1816,11 +1861,14 @@ def quotation_create():
         if not customer:
             return jsonify({"ok": False, "message": "请选择客户"}), 400
         own_company_name = (data.get("own_company_name") or "").strip()
-        shipping_unit = (data.get("shipping_unit") or customer["name"] or "").strip()
+        shipping_unit = (data.get("shipping_unit") or own_company_name).strip()
+        sender_address = (data.get("sender_address") or "").strip()
         if not own_company_name:
             return jsonify({"ok": False, "message": "请填写我方公司名称"}), 400
         if not shipping_unit:
             return jsonify({"ok": False, "message": "请填写发货单位"}), 400
+        if not sender_address:
+            return jsonify({"ok": False, "message": "请填写发货地址"}), 400
         items, error = clean_order_items(conn, data.get("items"), "sale_price")
         if error:
             return jsonify({"ok": False, "message": error}), 400
@@ -1831,12 +1879,12 @@ def quotation_create():
             """
             INSERT INTO quotations
             (quote_no,customer_id,quote_date,validity_date,own_company_name,shipping_unit,shipping_contact,
-             shipping_phone,shipping_address,delivery_date,delivery_method,status,remark,created_by,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)
+             shipping_phone,sender_address,shipping_address,delivery_date,delivery_method,status,remark,created_by,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)
             """,
             (quote_no, customer["id"], data.get("quote_date") or datetime.now().strftime("%Y-%m-%d"),
              data.get("validity_date") or "", own_company_name, shipping_unit, data.get("shipping_contact") or "",
-             data.get("shipping_phone") or "", data.get("shipping_address") or "", data.get("delivery_date") or "",
+             data.get("shipping_phone") or "", sender_address, data.get("shipping_address") or "", data.get("delivery_date") or "",
              data.get("delivery_method") or "", data.get("remark") or "", user["display_name"], now_text(), now_text()),
         )
         for item in items:
@@ -1861,9 +1909,10 @@ def quotation_update(quotation_id: int):
         if not customer:
             return jsonify({"ok": False, "message": "请选择客户"}), 400
         own_company_name = (data.get("own_company_name") or "").strip()
-        shipping_unit = (data.get("shipping_unit") or customer["name"] or "").strip()
-        if not own_company_name or not shipping_unit:
-            return jsonify({"ok": False, "message": "我方公司名称和发货单位必须填写"}), 400
+        shipping_unit = (data.get("shipping_unit") or own_company_name).strip()
+        sender_address = (data.get("sender_address") or "").strip()
+        if not own_company_name or not shipping_unit or not sender_address:
+            return jsonify({"ok": False, "message": "我方公司名称、发货单位和发货地址必须填写"}), 400
         items, error = clean_order_items(conn, data.get("items"), "sale_price")
         if error:
             return jsonify({"ok": False, "message": error}), 400
@@ -1872,11 +1921,11 @@ def quotation_update(quotation_id: int):
             return jsonify({"ok": False, "message": "报价单号已存在"}), 400
         conn.execute(
             """UPDATE quotations SET quote_no=?,customer_id=?,quote_date=?,validity_date=?,own_company_name=?,
-               shipping_unit=?,shipping_contact=?,shipping_phone=?,shipping_address=?,delivery_date=?,delivery_method=?,
+               shipping_unit=?,shipping_contact=?,shipping_phone=?,sender_address=?,shipping_address=?,delivery_date=?,delivery_method=?,
                remark=?,updated_at=? WHERE id=?""",
             (quote_no, customer["id"], data.get("quote_date") or quotation["quote_date"], data.get("validity_date") or "",
              own_company_name, shipping_unit, data.get("shipping_contact") or "", data.get("shipping_phone") or "",
-             data.get("shipping_address") or "", data.get("delivery_date") or "", data.get("delivery_method") or "",
+             sender_address, data.get("shipping_address") or "", data.get("delivery_date") or "", data.get("delivery_method") or "",
              data.get("remark") or "", now_text(), quotation_id),
         )
         conn.execute("DELETE FROM quotation_items WHERE quotation_id=?", (quotation_id,))
@@ -1898,6 +1947,188 @@ def quotation_delete(quotation_id: int):
             return jsonify({"ok": False, "message": "报价单不存在"}), 404
         conn.execute("DELETE FROM quotations WHERE id=?", (quotation_id,))
     log_action("删除报价单", quotation["quote_no"])
+    return jsonify({"ok": True})
+
+
+def delivery_note_items(conn: sqlite3.Connection, note_id: int) -> list[dict]:
+    return rows_to_list(conn.execute(
+        """
+        SELECT dni.*,p.code AS product_code,p.name AS product_name,p.description,p.unit,
+               soi.quantity AS ordered_quantity,soi.shipped_quantity
+        FROM delivery_note_items dni
+        JOIN products p ON p.id=dni.product_id
+        JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id
+        WHERE dni.delivery_note_id=? ORDER BY dni.id
+        """, (note_id,)
+    ))
+
+
+@app.get("/api/delivery-notes")
+@login_required
+def delivery_notes_list():
+    q = (request.args.get("q") or "").strip()
+    params = []
+    where = ""
+    if q:
+        where = "WHERE dn.note_no LIKE ? OR soh.order_no LIKE ? OR dn.receiving_unit LIKE ?"
+        params = [f"%{q}%"] * 3
+    with db() as conn:
+        rows = rows_to_list(conn.execute(
+            f"""
+            SELECT dn.*,soh.order_no,c.name AS customer_name,COUNT(dni.id) AS item_count,
+                   COALESCE(SUM(dni.quantity),0) AS total_quantity
+            FROM delivery_notes dn JOIN sales_order_headers soh ON soh.id=dn.sales_order_id
+            JOIN customers c ON c.id=soh.customer_id
+            LEFT JOIN delivery_note_items dni ON dni.delivery_note_id=dn.id
+            {where} GROUP BY dn.id ORDER BY dn.id DESC
+            """, params
+        ))
+        for row in rows:
+            row["items"] = delivery_note_items(conn, row["id"])
+        defaults = conn.execute(
+            """SELECT shipping_unit,sender_address FROM delivery_notes
+               WHERE shipping_unit!='' ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        if not defaults:
+            defaults = conn.execute(
+                """SELECT shipping_unit,sender_address FROM quotations
+                   WHERE shipping_unit!='' ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+    return jsonify({"ok": True, "items": rows,
+                    "default_shipping_unit": defaults["shipping_unit"] if defaults else "",
+                    "default_sender_address": defaults["sender_address"] if defaults and defaults["sender_address"] else ""})
+
+
+def validate_delivery_items(conn: sqlite3.Connection, order_id: int, raw_items: list) -> tuple[list[tuple], str | None]:
+    if not isinstance(raw_items, list) or not raw_items:
+        return [], "请至少填写一条本次发货明细"
+    cleaned = []
+    seen = set()
+    for index, entry in enumerate(raw_items, start=1):
+        try:
+            sales_item_id = int(entry.get("sales_order_item_id") or 0)
+            quantity = float(entry.get("quantity") or 0)
+        except (TypeError, ValueError):
+            return [], f"第 {index} 条发货数量格式不正确"
+        if quantity <= 0:
+            continue
+        item = conn.execute(
+            "SELECT * FROM sales_order_items WHERE id=? AND order_id=?", (sales_item_id, order_id)
+        ).fetchone()
+        if not item:
+            return [], f"第 {index} 条销售明细不存在"
+        if sales_item_id in seen:
+            return [], "同一备件不能在发货单中重复"
+        remaining = item["quantity"] - item["shipped_quantity"]
+        if quantity > remaining + 0.000001:
+            return [], f"第 {index} 条发货数量超过销售订单未发数量"
+        seen.add(sales_item_id)
+        cleaned.append((item, quantity, (entry.get("remark") or "").strip()))
+    if not cleaned:
+        return [], "请填写本次实际发货数量"
+    return cleaned, None
+
+
+@app.post("/api/delivery-notes")
+@login_required
+def delivery_note_create():
+    data = payload()
+    user = current_user()
+    with db() as conn:
+        try:
+            order_id = int(data.get("sales_order_id") or 0)
+        except (TypeError, ValueError):
+            order_id = 0
+        order = conn.execute(
+            """SELECT soh.*,c.name customer_name,c.contact,c.phone,c.address
+               FROM sales_order_headers soh JOIN customers c ON c.id=soh.customer_id WHERE soh.id=?""", (order_id,)
+        ).fetchone()
+        if not order or order["status"] in ("completed", "cancelled"):
+            return jsonify({"ok": False, "message": "请选择未完成的销售订单"}), 400
+        if conn.execute("SELECT 1 FROM delivery_notes WHERE sales_order_id=? AND status='draft'", (order_id,)).fetchone():
+            return jsonify({"ok": False, "message": "该销售订单已有待确认发货单，请先处理原发货单"}), 400
+        items, error = validate_delivery_items(conn, order_id, data.get("items"))
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        shipping_unit = (data.get("shipping_unit") or "").strip()
+        receiving_unit = (data.get("receiving_unit") or order["customer_name"] or "").strip()
+        if not shipping_unit or not receiving_unit:
+            return jsonify({"ok": False, "message": "发货单位和收货单位必须填写"}), 400
+        note_no = (data.get("note_no") or "").strip() or next_order_no(conn, "delivery_notes", "DN", "note_no")
+        if conn.execute("SELECT 1 FROM delivery_notes WHERE note_no=?", (note_no,)).fetchone():
+            return jsonify({"ok": False, "message": "发货单号已存在"}), 400
+        cursor = conn.execute(
+            """INSERT INTO delivery_notes
+            (note_no,sales_order_id,delivery_date,shipping_unit,sender_address,receiving_unit,receiver_contact,
+             receiver_phone,receiver_address,delivery_method,status,remark,created_by,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)""",
+            (note_no, order_id, data.get("delivery_date") or datetime.now().strftime("%Y-%m-%d"), shipping_unit,
+             data.get("sender_address") or "", receiving_unit, data.get("receiver_contact") or order["contact"] or "",
+             data.get("receiver_phone") or order["phone"] or "", data.get("receiver_address") or order["address"] or "",
+             data.get("delivery_method") or "", data.get("remark") or "", user["display_name"], now_text(), now_text()),
+        )
+        for item, quantity, remark in items:
+            conn.execute(
+                """INSERT INTO delivery_note_items
+                (delivery_note_id,sales_order_item_id,product_id,quantity,remark) VALUES (?,?,?,?,?)""",
+                (cursor.lastrowid, item["id"], item["product_id"], quantity, remark),
+            )
+    log_action("新增发货单", note_no)
+    return jsonify({"ok": True, "note_no": note_no})
+
+
+@app.post("/api/delivery-notes/<int:note_id>/confirm")
+@login_required
+def delivery_note_confirm(note_id: int):
+    user = current_user()
+    with db() as conn:
+        note = conn.execute("SELECT * FROM delivery_notes WHERE id=?", (note_id,)).fetchone()
+        if not note:
+            return jsonify({"ok": False, "message": "发货单不存在"}), 404
+        if note["status"] != "draft":
+            return jsonify({"ok": False, "message": "该发货单已经确认，不能重复扣减库存"}), 400
+        items = conn.execute(
+            """SELECT dni.*,soi.quantity ordered_quantity,soi.shipped_quantity,p.code,p.current_stock
+               FROM delivery_note_items dni JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id
+               JOIN products p ON p.id=dni.product_id WHERE dni.delivery_note_id=?""", (note_id,)
+        ).fetchall()
+        if not items:
+            return jsonify({"ok": False, "message": "发货单没有明细"}), 400
+        for item in items:
+            if item["quantity"] > item["ordered_quantity"] - item["shipped_quantity"] + 0.000001:
+                return jsonify({"ok": False, "message": f"备件 {item['code']} 的发货数量超过订单剩余数量"}), 400
+            if item["current_stock"] + 0.000001 < item["quantity"]:
+                return jsonify({"ok": False, "message": f"备件 {item['code']} 库存不足，当前库存 {item['current_stock']}"}), 400
+        for item in items:
+            conn.execute("UPDATE sales_order_items SET shipped_quantity=shipped_quantity+? WHERE id=?", (item["quantity"], item["sales_order_item_id"]))
+            conn.execute("UPDATE products SET current_stock=current_stock-?,updated_at=? WHERE id=?", (item["quantity"], now_text(), item["product_id"]))
+            conn.execute(
+                """INSERT INTO stock_movements
+                (product_id,movement_time,movement_type,quantity,operator,source_no,remark) VALUES (?,?,?,?,?,?,?)""",
+                (item["product_id"], now_text(), "发货单出库", -item["quantity"], user["display_name"], note["note_no"], "发货单确认后出库"),
+            )
+        remaining = conn.execute(
+            "SELECT COALESCE(SUM(quantity-shipped_quantity),0) FROM sales_order_items WHERE order_id=?", (note["sales_order_id"],)
+        ).fetchone()[0]
+        order_status = "completed" if remaining <= 0.000001 else "partial"
+        conn.execute("UPDATE sales_order_headers SET status=?,updated_at=?,completed_at=? WHERE id=?",
+                     (order_status, now_text(), now_text() if order_status == "completed" else None, note["sales_order_id"]))
+        conn.execute("UPDATE delivery_notes SET status='confirmed',confirmed_at=?,updated_at=? WHERE id=?", (now_text(), now_text(), note_id))
+    log_action("确认发货单", note["note_no"])
+    return jsonify({"ok": True, "note_no": note["note_no"], "order_status": order_status})
+
+
+@app.delete("/api/delivery-notes/<int:note_id>")
+@admin_required
+def delivery_note_delete(note_id: int):
+    with db() as conn:
+        note = conn.execute("SELECT * FROM delivery_notes WHERE id=?", (note_id,)).fetchone()
+        if not note:
+            return jsonify({"ok": False, "message": "发货单不存在"}), 404
+        if note["status"] != "draft":
+            return jsonify({"ok": False, "message": "已确认发货单不能删除"}), 400
+        conn.execute("DELETE FROM delivery_notes WHERE id=?", (note_id,))
+    log_action("删除发货单", note["note_no"])
     return jsonify({"ok": True})
 
 
