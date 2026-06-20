@@ -65,8 +65,8 @@ IMPORT_FIELDS = {
     "suppliers": ["name", "level", "contact", "phone", "address", "account_info", "company_type", "settlement", "remark"],
     "customers": ["name", "level", "contact", "phone", "address", "account_info", "company_type", "settlement", "total_sales", "received_amount", "remark"],
     "products": ["code", "name", "description", "unit", "current_stock", "safe_stock", "equipment", "part_type", "warranty_until", "origin", "purchase_price", "sale_price", "remark"],
-    "purchases": ["order_no", "supplier_code", "supplier_name", "order_date", "product_code", "name", "description", "unit", "quantity", "unit_price", "equipment", "part_type", "warranty_until", "origin", "remark"],
-    "sales": ["customer_code", "product_code", "quantity", "unit_price", "delivery_date", "remark"],
+    "purchases": ["order_no", "supplier_code", "supplier_name", "order_date", "expected_date", "product_code", "name", "description", "unit", "quantity", "unit_price", "equipment", "part_type", "warranty_until", "origin", "remark"],
+    "sales": ["order_no", "order_date", "customer_code", "product_code", "quantity", "unit_price", "delivery_date", "remark"],
 }
 
 FIELD_ALIASES = {
@@ -100,6 +100,7 @@ FIELD_ALIASES = {
     "quantity": ["数量"],
     "unit_price": ["单价"],
     "delivery_date": ["货期"],
+    "expected_date": ["到货时间", "预计到货日期", "要求到货日期"],
     "remark": ["备注"],
 }
 
@@ -260,6 +261,63 @@ def execute_schema() -> None:
                 FOREIGN KEY(product_id) REFERENCES products(id)
             );
 
+            -- V2：订单采用“主表 + 多条明细”结构，支持分批到货和分批发货。
+            CREATE TABLE IF NOT EXISTS purchase_order_headers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_no TEXT NOT NULL UNIQUE,
+                supplier_id INTEGER NOT NULL,
+                order_date TEXT NOT NULL,
+                expected_date TEXT,
+                buyer TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                remark TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(supplier_id) REFERENCES suppliers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS purchase_order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity REAL NOT NULL,
+                unit_price REAL NOT NULL,
+                amount REAL NOT NULL,
+                received_quantity REAL NOT NULL DEFAULT 0,
+                remark TEXT,
+                FOREIGN KEY(order_id) REFERENCES purchase_order_headers(id) ON DELETE CASCADE,
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS sales_order_headers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_no TEXT NOT NULL UNIQUE,
+                customer_id INTEGER NOT NULL,
+                order_date TEXT NOT NULL,
+                delivery_date TEXT,
+                seller TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                remark TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY(customer_id) REFERENCES customers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS sales_order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity REAL NOT NULL,
+                unit_price REAL NOT NULL,
+                amount REAL NOT NULL,
+                shipped_quantity REAL NOT NULL DEFAULT 0,
+                remark TEXT,
+                FOREIGN KEY(order_id) REFERENCES sales_order_headers(id) ON DELETE CASCADE,
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+
             CREATE TABLE IF NOT EXISTS stock_movements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id INTEGER NOT NULL,
@@ -285,6 +343,7 @@ def execute_schema() -> None:
         sales_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sales_orders)")}
         if "status" not in sales_columns:
             conn.execute("ALTER TABLE sales_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'")
+        migrate_legacy_orders(conn)
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             conn.execute(
                 "INSERT INTO users (username, password_hash, role, display_name, created_at) VALUES (?,?,?,?,?)",
@@ -294,6 +353,57 @@ def execute_schema() -> None:
                 "INSERT INTO users (username, password_hash, role, display_name, created_at) VALUES (?,?,?,?,?)",
                 ("user", generate_password_hash("user123"), "user", "普通用户", now_text()),
             )
+
+
+def migrate_legacy_orders(conn: sqlite3.Connection) -> None:
+    """把旧版单行订单迁移为已完成历史整单；库存不重复变化。"""
+    purchases = conn.execute("SELECT * FROM purchase_orders ORDER BY id").fetchall()
+    for old in purchases:
+        if conn.execute("SELECT 1 FROM purchase_order_headers WHERE order_no=?", (old["order_no"],)).fetchone():
+            continue
+        cursor = conn.execute(
+            """
+            INSERT INTO purchase_order_headers
+            (order_no,supplier_id,order_date,expected_date,buyer,status,remark,created_at,updated_at,completed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (old["order_no"], old["supplier_id"], old["order_date"], old["order_date"], old["buyer"],
+             "completed", old["remark"], old["created_at"], old["updated_at"], old["updated_at"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO purchase_order_items
+            (order_id,product_id,quantity,unit_price,amount,received_quantity,remark)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (cursor.lastrowid, old["product_id"], old["quantity"], old["unit_price"],
+             old["amount"], old["quantity"], "旧版采购记录迁移"),
+        )
+
+    sales = conn.execute("SELECT * FROM sales_orders ORDER BY id").fetchall()
+    for old in sales:
+        if conn.execute("SELECT 1 FROM sales_order_headers WHERE order_no=?", (old["order_no"],)).fetchone():
+            continue
+        cancelled = old["status"] == "voided"
+        cursor = conn.execute(
+            """
+            INSERT INTO sales_order_headers
+            (order_no,customer_id,order_date,delivery_date,seller,status,remark,created_at,updated_at,completed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (old["order_no"], old["customer_id"], old["order_date"], old["delivery_date"], old["seller"],
+             "cancelled" if cancelled else "completed", old["remark"], old["created_at"], old["updated_at"],
+             old["updated_at"] if not cancelled else None),
+        )
+        conn.execute(
+            """
+            INSERT INTO sales_order_items
+            (order_id,product_id,quantity,unit_price,amount,shipped_quantity,remark)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (cursor.lastrowid, old["product_id"], old["quantity"], old["unit_price"], old["amount"],
+             0 if cancelled else old["quantity"], "旧版销售记录迁移"),
+        )
 
 
 def current_user() -> dict | None:
@@ -627,8 +737,14 @@ def dashboard():
         supplier_total = conn.execute("SELECT COUNT(*) FROM suppliers").fetchone()[0]
         customer_total = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
         stock_value = conn.execute("SELECT COALESCE(SUM(current_stock * purchase_price),0) FROM products").fetchone()[0]
-        month_purchase = conn.execute("SELECT COALESCE(SUM(amount),0) FROM purchase_orders WHERE order_date>=?", (month_start,)).fetchone()[0]
-        month_sales = conn.execute("SELECT COALESCE(SUM(amount),0) FROM sales_orders WHERE order_date>=?", (month_start,)).fetchone()[0]
+        month_purchase = conn.execute(
+            """SELECT COALESCE(SUM(poi.amount),0) FROM purchase_order_headers poh
+               JOIN purchase_order_items poi ON poi.order_id=poh.id WHERE poh.order_date>=?""", (month_start,)
+        ).fetchone()[0]
+        month_sales = conn.execute(
+            """SELECT COALESCE(SUM(soi.amount),0) FROM sales_order_headers soh
+               JOIN sales_order_items soi ON soi.order_id=soh.id WHERE soh.order_date>=? AND soh.status!='cancelled'""", (month_start,)
+        ).fetchone()[0]
         low_stock = conn.execute("SELECT COUNT(*) FROM products WHERE current_stock <= safe_stock").fetchone()[0]
         warranty_soon = conn.execute(
             "SELECT COUNT(*) FROM products WHERE warranty_until IS NOT NULL AND warranty_until!='' AND warranty_until <= date('now','+30 day')"
@@ -636,6 +752,14 @@ def dashboard():
         recent_low = rows_to_list(conn.execute(
             "SELECT code, name, current_stock, safe_stock FROM products WHERE current_stock <= safe_stock ORDER BY current_stock ASC LIMIT 8"
         ))
+        overdue_purchases = conn.execute(
+            """SELECT COUNT(*) FROM purchase_order_headers WHERE status!='completed' AND expected_date!=''
+               AND date(expected_date)<date('now','localtime')"""
+        ).fetchone()[0]
+        overdue_sales = conn.execute(
+            """SELECT COUNT(*) FROM sales_order_headers WHERE status NOT IN ('completed','cancelled') AND delivery_date!=''
+               AND date(delivery_date)<date('now','localtime')"""
+        ).fetchone()[0]
     return jsonify({
         "ok": True,
         "cards": {
@@ -648,6 +772,8 @@ def dashboard():
             "month_profit": month_sales - month_purchase,
             "low_stock": low_stock,
             "warranty_soon": warranty_soon,
+            "overdue_purchases": overdue_purchases,
+            "overdue_sales": overdue_sales,
         },
         "low_stock_items": recent_low,
     })
@@ -735,7 +861,10 @@ def suppliers_update(item_id: int):
 @admin_required
 def suppliers_delete(item_id: int):
     with db() as conn:
-        used = conn.execute("SELECT COUNT(*) FROM purchase_orders WHERE supplier_id=?", (item_id,)).fetchone()[0]
+        used = conn.execute(
+            """SELECT (SELECT COUNT(*) FROM purchase_orders WHERE supplier_id=?) +
+                      (SELECT COUNT(*) FROM purchase_order_headers WHERE supplier_id=?)""", (item_id, item_id)
+        ).fetchone()[0]
         if used:
             return jsonify({"ok": False, "message": "该供应商已有采购单记录，不能删除；建议保留资料或后续增加停用功能"}), 400
         supplier = conn.execute("SELECT document_path,photo_path FROM suppliers WHERE id=?", (item_id,)).fetchone()
@@ -861,7 +990,10 @@ def customers_update(item_id: int):
 @admin_required
 def customers_delete(item_id: int):
     with db() as conn:
-        used = conn.execute("SELECT COUNT(*) FROM sales_orders WHERE customer_id=?", (item_id,)).fetchone()[0]
+        used = conn.execute(
+            """SELECT (SELECT COUNT(*) FROM sales_orders WHERE customer_id=?) +
+                      (SELECT COUNT(*) FROM sales_order_headers WHERE customer_id=?)""", (item_id, item_id)
+        ).fetchone()[0]
         if used:
             return jsonify({"ok": False, "message": "该客户已有销售单记录，不能删除；建议保留资料或后续增加停用功能"}), 400
         conn.execute("DELETE FROM customers WHERE id=?", (item_id,))
@@ -923,9 +1055,11 @@ def products_delete(item_id: int):
             SELECT
               (SELECT COUNT(*) FROM purchase_orders WHERE product_id=?) +
               (SELECT COUNT(*) FROM sales_orders WHERE product_id=?) +
+              (SELECT COUNT(*) FROM purchase_order_items WHERE product_id=?) +
+              (SELECT COUNT(*) FROM sales_order_items WHERE product_id=?) +
               (SELECT COUNT(*) FROM stock_movements WHERE product_id=?)
             """,
-            (item_id, item_id, item_id),
+            (item_id, item_id, item_id, item_id, item_id),
         ).fetchone()[0]
         if used:
             return jsonify({"ok": False, "message": "该产品已有订单或库存流水，不能删除；建议保留资料或后续增加停用功能"}), 400
@@ -950,7 +1084,7 @@ def template_info():
     })
 
 
-@app.get("/api/purchases")
+@app.get("/api/legacy/purchases")
 @login_required
 def purchases_list():
     with db() as conn:
@@ -967,7 +1101,7 @@ def purchases_list():
     return jsonify({"ok": True, "items": rows})
 
 
-@app.post("/api/purchases")
+@app.post("/api/legacy/purchases")
 @login_required
 def purchases_create():
     data = payload()
@@ -1011,7 +1145,7 @@ def purchases_create():
     return jsonify({"ok": True, "order_no": order_no})
 
 
-@app.put("/api/purchases/<int:item_id>")
+@app.put("/api/legacy/purchases/<int:item_id>")
 @login_required
 def purchases_update(item_id: int):
     data = payload()
@@ -1081,7 +1215,7 @@ def purchases_update(item_id: int):
     return jsonify({"ok": True, "order_no": order_no})
 
 
-@app.get("/api/sales")
+@app.get("/api/legacy/sales")
 @login_required
 def sales_list():
     with db() as conn:
@@ -1098,7 +1232,7 @@ def sales_list():
     return jsonify({"ok": True, "items": rows})
 
 
-@app.post("/api/sales")
+@app.post("/api/legacy/sales")
 @login_required
 def sales_create():
     data = payload()
@@ -1147,7 +1281,7 @@ def sales_create():
     return jsonify({"ok": True, "order_no": order_no})
 
 
-@app.put("/api/sales/<int:item_id>")
+@app.put("/api/legacy/sales/<int:item_id>")
 @admin_required
 def sales_update(item_id: int):
     data = payload()
@@ -1209,7 +1343,7 @@ def sales_update(item_id: int):
     return jsonify({"ok": True, "order_no": old_order["order_no"]})
 
 
-@app.post("/api/sales/<int:item_id>/void")
+@app.post("/api/legacy/sales/<int:item_id>/void")
 @admin_required
 def sales_void(item_id: int):
     user = current_user()
@@ -1228,6 +1362,371 @@ def sales_void(item_id: int):
         )
     log_action("作废销售单", order["order_no"])
     return jsonify({"ok": True, "order_no": order["order_no"]})
+
+
+def clean_order_items(conn: sqlite3.Connection, raw_items: list, price_field: str) -> tuple[list[dict], str | None]:
+    """校验整单明细，并补齐产品名称、单位等显示信息。"""
+    if not isinstance(raw_items, list) or not raw_items:
+        return [], "请至少添加一条备件明细"
+    cleaned = []
+    seen = set()
+    for index, item in enumerate(raw_items, start=1):
+        try:
+            product_id = int(item.get("product_id") or 0)
+            quantity = float(item.get("quantity") or 0)
+            unit_price = float(item.get("unit_price") or 0)
+        except (TypeError, ValueError):
+            return [], f"第 {index} 条明细的数量或单价格式不正确"
+        product = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if not product:
+            return [], f"第 {index} 条明细的备件不存在"
+        if product_id in seen:
+            return [], f"备件 {product['code']} 在同一订单中重复，请合并数量"
+        if quantity <= 0:
+            return [], f"第 {index} 条明细的数量必须大于 0"
+        if unit_price < 0:
+            return [], f"第 {index} 条明细的单价不能小于 0"
+        seen.add(product_id)
+        cleaned.append({
+            "product_id": product_id,
+            "product_code": product["code"],
+            "product_name": product["name"],
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "amount": quantity * unit_price,
+            "remark": (item.get("remark") or "").strip(),
+            "price_field": price_field,
+        })
+    return cleaned, None
+
+
+def order_items(conn: sqlite3.Connection, order_id: int, kind: str) -> list[dict]:
+    table = "purchase_order_items" if kind == "purchase" else "sales_order_items"
+    processed = "received_quantity" if kind == "purchase" else "shipped_quantity"
+    return rows_to_list(conn.execute(
+        f"""
+        SELECT oi.*, p.code AS product_code, p.name AS product_name, p.description, p.unit,
+               p.current_stock, oi.{processed} AS processed_quantity,
+               oi.quantity - oi.{processed} AS remaining_quantity
+        FROM {table} oi JOIN products p ON p.id=oi.product_id
+        WHERE oi.order_id=? ORDER BY oi.id
+        """,
+        (order_id,),
+    ))
+
+
+@app.get("/api/purchases")
+@login_required
+def purchase_headers_list():
+    q = (request.args.get("q") or "").strip()
+    params = []
+    where = ""
+    if q:
+        where = "WHERE poh.order_no LIKE ? OR s.name LIKE ?"
+        params = [f"%{q}%", f"%{q}%"]
+    with db() as conn:
+        rows = rows_to_list(conn.execute(
+            f"""
+            SELECT poh.*, s.code AS supplier_code, s.name AS supplier_name,
+                   COUNT(poi.id) AS item_count, COALESCE(SUM(poi.quantity),0) AS total_quantity,
+                   COALESCE(SUM(poi.received_quantity),0) AS processed_quantity,
+                   COALESCE(SUM(poi.amount),0) AS amount,
+                   CASE WHEN poh.status!='completed' AND poh.expected_date!=''
+                             AND date(poh.expected_date) < date('now','localtime') THEN 1 ELSE 0 END AS overdue
+            FROM purchase_order_headers poh
+            JOIN suppliers s ON s.id=poh.supplier_id
+            LEFT JOIN purchase_order_items poi ON poi.order_id=poh.id
+            {where}
+            GROUP BY poh.id ORDER BY poh.id DESC
+            """,
+            params,
+        ))
+        for row in rows:
+            row["items"] = order_items(conn, row["id"], "purchase")
+    return jsonify({"ok": True, "items": rows})
+
+
+@app.post("/api/purchases")
+@login_required
+def purchase_header_create():
+    data = payload()
+    user = current_user()
+    with db() as conn:
+        supplier = conn.execute("SELECT id FROM suppliers WHERE id=?", (data.get("supplier_id"),)).fetchone()
+        if not supplier:
+            return jsonify({"ok": False, "message": "请选择供应商"}), 400
+        items, error = clean_order_items(conn, data.get("items"), "purchase_price")
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        order_no = (data.get("order_no") or "").strip() or next_order_no(conn, "purchase_order_headers", "PO")
+        if conn.execute("SELECT 1 FROM purchase_order_headers WHERE order_no=?", (order_no,)).fetchone():
+            return jsonify({"ok": False, "message": "采购单号已存在"}), 400
+        order_date = data.get("order_date") or datetime.now().strftime("%Y-%m-%d")
+        expected_date = data.get("expected_date") or ""
+        cursor = conn.execute(
+            """
+            INSERT INTO purchase_order_headers
+            (order_no,supplier_id,order_date,expected_date,buyer,status,remark,created_at,updated_at)
+            VALUES (?,?,?,?,?,'pending',?,?,?)
+            """,
+            (order_no, supplier["id"], order_date, expected_date, user["display_name"],
+             data.get("remark"), now_text(), now_text()),
+        )
+        for item in items:
+            conn.execute(
+                """INSERT INTO purchase_order_items
+                (order_id,product_id,quantity,unit_price,amount,received_quantity,remark)
+                VALUES (?,?,?,?,?,0,?)""",
+                (cursor.lastrowid, item["product_id"], item["quantity"], item["unit_price"], item["amount"], item["remark"]),
+            )
+            conn.execute("UPDATE products SET purchase_price=?,updated_at=? WHERE id=?",
+                         (item["unit_price"], now_text(), item["product_id"]))
+    log_action("新增采购整单", order_no)
+    return jsonify({"ok": True, "order_no": order_no})
+
+
+@app.put("/api/purchases/<int:order_id>")
+@admin_required
+def purchase_header_update(order_id: int):
+    data = payload()
+    with db() as conn:
+        order = conn.execute("SELECT * FROM purchase_order_headers WHERE id=?", (order_id,)).fetchone()
+        if not order:
+            return jsonify({"ok": False, "message": "采购单不存在"}), 404
+        if order["status"] != "pending":
+            return jsonify({"ok": False, "message": "已经开始到货的采购单不能修改明细"}), 400
+        supplier = conn.execute("SELECT id FROM suppliers WHERE id=?", (data.get("supplier_id"),)).fetchone()
+        if not supplier:
+            return jsonify({"ok": False, "message": "请选择供应商"}), 400
+        items, error = clean_order_items(conn, data.get("items"), "purchase_price")
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        order_no = (data.get("order_no") or order["order_no"]).strip()
+        duplicate = conn.execute("SELECT 1 FROM purchase_order_headers WHERE order_no=? AND id<>?", (order_no, order_id)).fetchone()
+        if duplicate:
+            return jsonify({"ok": False, "message": "采购单号已存在"}), 400
+        conn.execute(
+            """UPDATE purchase_order_headers SET order_no=?,supplier_id=?,order_date=?,expected_date=?,remark=?,updated_at=? WHERE id=?""",
+            (order_no, supplier["id"], data.get("order_date") or order["order_date"], data.get("expected_date") or "",
+             data.get("remark"), now_text(), order_id),
+        )
+        conn.execute("DELETE FROM purchase_order_items WHERE order_id=?", (order_id,))
+        for item in items:
+            conn.execute(
+                "INSERT INTO purchase_order_items (order_id,product_id,quantity,unit_price,amount,received_quantity,remark) VALUES (?,?,?,?,?,0,?)",
+                (order_id, item["product_id"], item["quantity"], item["unit_price"], item["amount"], item["remark"]),
+            )
+    log_action("修改采购整单", order_no)
+    return jsonify({"ok": True, "order_no": order_no})
+
+
+@app.post("/api/purchases/<int:order_id>/receive")
+@login_required
+def purchase_receive(order_id: int):
+    data = payload()
+    entries = data.get("items") or []
+    user = current_user()
+    with db() as conn:
+        order = conn.execute("SELECT * FROM purchase_order_headers WHERE id=?", (order_id,)).fetchone()
+        if not order:
+            return jsonify({"ok": False, "message": "采购单不存在"}), 404
+        if order["status"] == "completed":
+            return jsonify({"ok": False, "message": "采购单已全部到货，不能重复入库"}), 400
+        changes = []
+        for entry in entries:
+            try:
+                item_id = int(entry.get("item_id") or 0)
+                quantity = float(entry.get("quantity") or 0)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "message": "到货数量格式不正确"}), 400
+            if quantity <= 0:
+                continue
+            item = conn.execute("SELECT * FROM purchase_order_items WHERE id=? AND order_id=?", (item_id, order_id)).fetchone()
+            if not item or quantity > item["quantity"] - item["received_quantity"] + 0.000001:
+                return jsonify({"ok": False, "message": "到货数量超过该备件的未到货数量"}), 400
+            changes.append((item, quantity))
+        if not changes:
+            return jsonify({"ok": False, "message": "请填写本次实际到货数量"}), 400
+        for item, quantity in changes:
+            conn.execute("UPDATE purchase_order_items SET received_quantity=received_quantity+? WHERE id=?", (quantity, item["id"]))
+            conn.execute("UPDATE products SET current_stock=current_stock+?,updated_at=? WHERE id=?", (quantity, now_text(), item["product_id"]))
+            conn.execute(
+                "INSERT INTO stock_movements (product_id,movement_time,movement_type,quantity,operator,source_no,remark) VALUES (?,?,?,?,?,?,?)",
+                (item["product_id"], now_text(), "采购到货入库", quantity, user["display_name"], order["order_no"], data.get("remark") or "分批到货确认"),
+            )
+        remaining = conn.execute(
+            "SELECT COALESCE(SUM(quantity-received_quantity),0) FROM purchase_order_items WHERE order_id=?", (order_id,)
+        ).fetchone()[0]
+        status = "completed" if remaining <= 0.000001 else "partial"
+        conn.execute(
+            "UPDATE purchase_order_headers SET status=?,updated_at=?,completed_at=? WHERE id=?",
+            (status, now_text(), now_text() if status == "completed" else None, order_id),
+        )
+    log_action("采购到货确认", f"{order['order_no']} 状态 {status}")
+    return jsonify({"ok": True, "order_no": order["order_no"], "status": status})
+
+
+@app.get("/api/sales")
+@login_required
+def sales_headers_list():
+    q = (request.args.get("q") or "").strip()
+    params = []
+    where = ""
+    if q:
+        where = "WHERE soh.order_no LIKE ? OR c.name LIKE ?"
+        params = [f"%{q}%", f"%{q}%"]
+    with db() as conn:
+        rows = rows_to_list(conn.execute(
+            f"""
+            SELECT soh.*, c.code AS customer_code, c.name AS customer_name,
+                   COUNT(soi.id) AS item_count, COALESCE(SUM(soi.quantity),0) AS total_quantity,
+                   COALESCE(SUM(soi.shipped_quantity),0) AS processed_quantity,
+                   COALESCE(SUM(soi.amount),0) AS amount,
+                   CASE WHEN soh.status NOT IN ('completed','cancelled') AND soh.delivery_date!=''
+                             AND date(soh.delivery_date) < date('now','localtime') THEN 1 ELSE 0 END AS overdue
+            FROM sales_order_headers soh
+            JOIN customers c ON c.id=soh.customer_id
+            LEFT JOIN sales_order_items soi ON soi.order_id=soh.id
+            {where}
+            GROUP BY soh.id ORDER BY soh.id DESC
+            """,
+            params,
+        ))
+        for row in rows:
+            row["items"] = order_items(conn, row["id"], "sales")
+    return jsonify({"ok": True, "items": rows})
+
+
+@app.post("/api/sales")
+@login_required
+def sales_header_create():
+    data = payload()
+    user = current_user()
+    with db() as conn:
+        customer = conn.execute("SELECT id FROM customers WHERE id=?", (data.get("customer_id"),)).fetchone()
+        if not customer:
+            return jsonify({"ok": False, "message": "请选择客户"}), 400
+        items, error = clean_order_items(conn, data.get("items"), "sale_price")
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        order_no = (data.get("order_no") or "").strip() or next_order_no(conn, "sales_order_headers", "SO")
+        if conn.execute("SELECT 1 FROM sales_order_headers WHERE order_no=?", (order_no,)).fetchone():
+            return jsonify({"ok": False, "message": "销售单号已存在"}), 400
+        order_date = data.get("order_date") or datetime.now().strftime("%Y-%m-%d")
+        cursor = conn.execute(
+            """
+            INSERT INTO sales_order_headers
+            (order_no,customer_id,order_date,delivery_date,seller,status,remark,created_at,updated_at)
+            VALUES (?,?,?,?,?,'pending',?,?,?)
+            """,
+            (order_no, customer["id"], order_date, data.get("delivery_date") or "", user["display_name"],
+             data.get("remark"), now_text(), now_text()),
+        )
+        total = 0
+        for item in items:
+            total += item["amount"]
+            conn.execute(
+                """INSERT INTO sales_order_items
+                (order_id,product_id,quantity,unit_price,amount,shipped_quantity,remark)
+                VALUES (?,?,?,?,?,0,?)""",
+                (cursor.lastrowid, item["product_id"], item["quantity"], item["unit_price"], item["amount"], item["remark"]),
+            )
+            conn.execute("UPDATE products SET sale_price=?,updated_at=? WHERE id=?", (item["unit_price"], now_text(), item["product_id"]))
+        conn.execute("UPDATE customers SET total_sales=total_sales+?,updated_at=? WHERE id=?", (total, now_text(), customer["id"]))
+    log_action("新增销售整单", order_no)
+    return jsonify({"ok": True, "order_no": order_no})
+
+
+@app.put("/api/sales/<int:order_id>")
+@admin_required
+def sales_header_update(order_id: int):
+    data = payload()
+    with db() as conn:
+        order = conn.execute("SELECT * FROM sales_order_headers WHERE id=?", (order_id,)).fetchone()
+        if not order:
+            return jsonify({"ok": False, "message": "销售单不存在"}), 404
+        if order["status"] != "pending":
+            return jsonify({"ok": False, "message": "已经开始发货的销售单不能修改明细"}), 400
+        customer = conn.execute("SELECT id FROM customers WHERE id=?", (data.get("customer_id"),)).fetchone()
+        if not customer:
+            return jsonify({"ok": False, "message": "请选择客户"}), 400
+        items, error = clean_order_items(conn, data.get("items"), "sale_price")
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        order_no = (data.get("order_no") or order["order_no"]).strip()
+        if conn.execute("SELECT 1 FROM sales_order_headers WHERE order_no=? AND id<>?", (order_no, order_id)).fetchone():
+            return jsonify({"ok": False, "message": "销售单号已存在"}), 400
+        old_total = conn.execute("SELECT COALESCE(SUM(amount),0) FROM sales_order_items WHERE order_id=?", (order_id,)).fetchone()[0]
+        new_total = sum(item["amount"] for item in items)
+        conn.execute("UPDATE customers SET total_sales=total_sales-?,updated_at=? WHERE id=?", (old_total, now_text(), order["customer_id"]))
+        conn.execute("UPDATE customers SET total_sales=total_sales+?,updated_at=? WHERE id=?", (new_total, now_text(), customer["id"]))
+        conn.execute(
+            """UPDATE sales_order_headers SET order_no=?,customer_id=?,order_date=?,delivery_date=?,remark=?,updated_at=? WHERE id=?""",
+            (order_no, customer["id"], data.get("order_date") or order["order_date"], data.get("delivery_date") or "",
+             data.get("remark"), now_text(), order_id),
+        )
+        conn.execute("DELETE FROM sales_order_items WHERE order_id=?", (order_id,))
+        for item in items:
+            conn.execute(
+                "INSERT INTO sales_order_items (order_id,product_id,quantity,unit_price,amount,shipped_quantity,remark) VALUES (?,?,?,?,?,0,?)",
+                (order_id, item["product_id"], item["quantity"], item["unit_price"], item["amount"], item["remark"]),
+            )
+    log_action("修改销售整单", order_no)
+    return jsonify({"ok": True, "order_no": order_no})
+
+
+@app.post("/api/sales/<int:order_id>/ship")
+@login_required
+def sales_ship(order_id: int):
+    data = payload()
+    entries = data.get("items") or []
+    user = current_user()
+    with db() as conn:
+        order = conn.execute("SELECT * FROM sales_order_headers WHERE id=?", (order_id,)).fetchone()
+        if not order:
+            return jsonify({"ok": False, "message": "销售单不存在"}), 404
+        if order["status"] == "completed":
+            return jsonify({"ok": False, "message": "销售单已全部发货，不能重复出库"}), 400
+        changes = []
+        stock_needed = {}
+        for entry in entries:
+            try:
+                item_id = int(entry.get("item_id") or 0)
+                quantity = float(entry.get("quantity") or 0)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "message": "发货数量格式不正确"}), 400
+            if quantity <= 0:
+                continue
+            item = conn.execute("SELECT * FROM sales_order_items WHERE id=? AND order_id=?", (item_id, order_id)).fetchone()
+            if not item or quantity > item["quantity"] - item["shipped_quantity"] + 0.000001:
+                return jsonify({"ok": False, "message": "发货数量超过该备件的未发货数量"}), 400
+            stock_needed[item["product_id"]] = stock_needed.get(item["product_id"], 0) + quantity
+            changes.append((item, quantity))
+        if not changes:
+            return jsonify({"ok": False, "message": "请填写本次实际发货数量"}), 400
+        for product_id, needed in stock_needed.items():
+            product = conn.execute("SELECT code,current_stock FROM products WHERE id=?", (product_id,)).fetchone()
+            if not product or product["current_stock"] + 0.000001 < needed:
+                current = product["current_stock"] if product else 0
+                code = product["code"] if product else str(product_id)
+                return jsonify({"ok": False, "message": f"备件 {code} 库存不足，当前库存 {current}"}), 400
+        for item, quantity in changes:
+            conn.execute("UPDATE sales_order_items SET shipped_quantity=shipped_quantity+? WHERE id=?", (quantity, item["id"]))
+            conn.execute("UPDATE products SET current_stock=current_stock-?,updated_at=? WHERE id=?", (quantity, now_text(), item["product_id"]))
+            conn.execute(
+                "INSERT INTO stock_movements (product_id,movement_time,movement_type,quantity,operator,source_no,remark) VALUES (?,?,?,?,?,?,?)",
+                (item["product_id"], now_text(), "销售发货出库", -quantity, user["display_name"], order["order_no"], data.get("remark") or "分批发货确认"),
+            )
+        remaining = conn.execute(
+            "SELECT COALESCE(SUM(quantity-shipped_quantity),0) FROM sales_order_items WHERE order_id=?", (order_id,)
+        ).fetchone()[0]
+        status = "completed" if remaining <= 0.000001 else "partial"
+        conn.execute(
+            "UPDATE sales_order_headers SET status=?,updated_at=?,completed_at=? WHERE id=?",
+            (status, now_text(), now_text() if status == "completed" else None, order_id),
+        )
+    log_action("销售发货确认", f"{order['order_no']} 状态 {status}")
+    return jsonify({"ok": True, "order_no": order["order_no"], "status": status})
 
 
 @app.get("/api/stock")
@@ -1274,7 +1773,7 @@ def stock_manual():
     return jsonify({"ok": True})
 
 
-@app.get("/api/stats")
+@app.get("/api/legacy/stats")
 @login_required
 def stats():
     start, end = date_range_from_request()
@@ -1371,6 +1870,78 @@ def stats():
     })
 
 
+@app.get("/api/stats")
+@login_required
+def order_stats():
+    """按整单结构统计，次数按订单数计算，数量和金额按明细合计。"""
+    start, end = date_range_from_request()
+    product_id = request.args.get("product_id")
+    customer_id = request.args.get("customer_id")
+    supplier_id = request.args.get("supplier_id")
+    order_no = (request.args.get("order_no") or "").strip()
+    purchase_filters = ["poh.order_date BETWEEN ? AND ?"]
+    purchase_params: list = [start, end]
+    sales_filters = ["soh.order_date BETWEEN ? AND ?", "soh.status!='cancelled'"]
+    sales_params: list = [start, end]
+    if product_id:
+        purchase_filters.append("poi.product_id=?")
+        purchase_params.append(product_id)
+        sales_filters.append("soi.product_id=?")
+        sales_params.append(product_id)
+    if supplier_id:
+        purchase_filters.append("poh.supplier_id=?")
+        purchase_params.append(supplier_id)
+    if customer_id:
+        sales_filters.append("soh.customer_id=?")
+        sales_params.append(customer_id)
+    if order_no:
+        purchase_filters.append("poh.order_no LIKE ?")
+        purchase_params.append(f"%{order_no}%")
+        sales_filters.append("soh.order_no LIKE ?")
+        sales_params.append(f"%{order_no}%")
+    purchase_sql = " AND ".join(purchase_filters)
+    sales_sql = " AND ".join(sales_filters)
+    with db() as conn:
+        purchase = row_to_dict(conn.execute(
+            f"""SELECT COALESCE(SUM(poi.amount),0) amount,COALESCE(SUM(poi.quantity),0) quantity,
+                       COUNT(DISTINCT poh.id) count FROM purchase_order_headers poh
+                 JOIN purchase_order_items poi ON poi.order_id=poh.id WHERE {purchase_sql}""", purchase_params
+        ).fetchone())
+        sales = row_to_dict(conn.execute(
+            f"""SELECT COALESCE(SUM(soi.amount),0) amount,COALESCE(SUM(soi.quantity),0) quantity,
+                       COUNT(DISTINCT soh.id) count FROM sales_order_headers soh
+                 JOIN sales_order_items soi ON soi.order_id=soh.id WHERE {sales_sql}""", sales_params
+        ).fetchone())
+        customer_rank = rows_to_list(conn.execute(
+            """SELECT c.name,COALESCE(SUM(soi.amount),0) amount FROM customers c
+               LEFT JOIN sales_order_headers soh ON soh.customer_id=c.id AND soh.order_date BETWEEN ? AND ? AND soh.status!='cancelled'
+               LEFT JOIN sales_order_items soi ON soi.order_id=soh.id GROUP BY c.id ORDER BY amount DESC LIMIT 10""", (start, end)
+        ))
+        supplier_rank = rows_to_list(conn.execute(
+            """SELECT s.name,COALESCE(SUM(poi.amount),0) amount FROM suppliers s
+               LEFT JOIN purchase_order_headers poh ON poh.supplier_id=s.id AND poh.order_date BETWEEN ? AND ?
+               LEFT JOIN purchase_order_items poi ON poi.order_id=poh.id GROUP BY s.id ORDER BY amount DESC LIMIT 10""", (start, end)
+        ))
+        product_rank = rows_to_list(conn.execute(
+            """SELECT p.code,p.name,p.current_stock,
+               COALESCE((SELECT SUM(poi.quantity) FROM purchase_order_items poi JOIN purchase_order_headers poh ON poh.id=poi.order_id WHERE poi.product_id=p.id AND poh.order_date BETWEEN ? AND ?),0) purchase_qty,
+               COALESCE((SELECT SUM(soi.quantity) FROM sales_order_items soi JOIN sales_order_headers soh ON soh.id=soi.order_id WHERE soi.product_id=p.id AND soh.order_date BETWEEN ? AND ? AND soh.status!='cancelled'),0) sales_qty
+               FROM products p ORDER BY sales_qty DESC LIMIT 20""", (start, end, start, end)
+        ))
+        order_profit = rows_to_list(conn.execute(
+            """SELECT soh.order_no,soh.order_date,c.name customer_name,p.code product_code,p.name product_name,
+               soi.quantity sales_qty,soi.amount sales_amount,
+               COALESCE(p.purchase_price,0)*soi.quantity estimated_cost,
+               soi.amount-COALESCE(p.purchase_price,0)*soi.quantity profit
+               FROM sales_order_headers soh JOIN sales_order_items soi ON soi.order_id=soh.id
+               JOIN customers c ON c.id=soh.customer_id JOIN products p ON p.id=soi.product_id
+               WHERE soh.order_date BETWEEN ? AND ? AND soh.status!='cancelled' ORDER BY soh.id DESC LIMIT 50""", (start, end)
+        ))
+    return jsonify({"ok": True, "start": start, "end": end, "purchase": purchase, "sales": sales,
+                    "profit": sales["amount"] - purchase["amount"], "customer_rank": customer_rank,
+                    "supplier_rank": supplier_rank, "product_rank": product_rank, "order_profit": order_profit})
+
+
 @app.get("/api/logs")
 @admin_required
 def logs():
@@ -1396,14 +1967,35 @@ def export_table(table: str):
         "suppliers": "suppliers",
         "customers": "customers",
         "products": "products",
-        "purchases": "purchase_orders",
-        "sales": "sales_orders",
         "stock": "stock_movements",
     }
-    if table not in allowed:
+    if table not in allowed and table not in ("purchases", "sales"):
         return jsonify({"ok": False, "message": "不支持导出该数据"}), 400
     with db() as conn:
-        rows = rows_to_list(conn.execute(f"SELECT * FROM {allowed[table]} ORDER BY id DESC"))
+        if table == "purchases":
+            rows = rows_to_list(conn.execute(
+                """SELECT poh.order_no AS 采购单号,s.name AS 供应商,poh.order_date AS 采购日期,
+                   poh.expected_date AS 要求到货日期,p.code AS 备件编号,p.name AS 产品名称,p.description AS 技术描述,
+                   p.unit AS 单位,poi.quantity AS 数量,poi.received_quantity AS 已到货数量,
+                   poi.unit_price AS 单价,poi.amount AS 金额,poh.status AS 状态,poh.remark AS 订单备注
+                   FROM purchase_order_headers poh JOIN suppliers s ON s.id=poh.supplier_id
+                   JOIN purchase_order_items poi ON poi.order_id=poh.id JOIN products p ON p.id=poi.product_id
+                   ORDER BY poh.id DESC,poi.id"""
+            ))
+        elif table == "sales":
+            rows = rows_to_list(conn.execute(
+                """SELECT soh.order_no AS 销售单号,c.name AS 客户,soh.order_date AS 销售日期,
+                   soh.delivery_date AS 要求发货日期,p.code AS 备件编号,p.name AS 产品名称,p.description AS 技术描述,
+                   p.unit AS 单位,soi.quantity AS 数量,soi.shipped_quantity AS 已发货数量,
+                   soi.unit_price AS 单价,soi.amount AS 金额,soh.status AS 状态,soh.remark AS 订单备注
+                   FROM sales_order_headers soh JOIN customers c ON c.id=soh.customer_id
+                   JOIN sales_order_items soi ON soi.order_id=soh.id JOIN products p ON p.id=soi.product_id
+                   ORDER BY soh.id DESC,soi.id"""
+            ))
+        else:
+            if table not in allowed:
+                return jsonify({"ok": False, "message": "不支持导出该数据"}), 400
+            rows = rows_to_list(conn.execute(f"SELECT * FROM {allowed[table]} ORDER BY id DESC"))
     output = io.StringIO()
     if rows:
         writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
@@ -1435,6 +2027,8 @@ def import_table(table: str):
         return jsonify({"ok": False, "message": "请上传 CSV 或 XLSX 文件"}), 400
 
     fields = IMPORT_FIELDS[table]
+    if table in ("purchases", "sales"):
+        return import_order_rows(table, rows, fields)
     imported = 0
     skipped: list[str] = []
     imported_rows: list[str] = []
@@ -1576,6 +2170,110 @@ def import_table(table: str):
         "skipped": skipped[:30],
         "skipped_count": len(skipped),
     })
+
+
+def import_order_rows(table: str, rows: list[dict], fields: list[str]):
+    """把 Excel 多行按订单号合并为整单；导入不直接改变库存。"""
+    imported = 0
+    skipped: list[str] = []
+    imported_rows: list[str] = []
+    operator = current_user()["display_name"]
+    with db() as conn:
+        header_table = "purchase_order_headers" if table == "purchases" else "sales_order_headers"
+        prefix = "PO" if table == "purchases" else "SO"
+        fallback_order_no = next_order_no(conn, header_table, prefix)
+        created_orders: dict[str, int] = {}
+        for row_number, raw in enumerate(rows, start=1):
+            data = {field: import_value(raw, field) for field in fields}
+            order_no = (data.get("order_no") or "").strip() or fallback_order_no
+            product_code = (data.get("product_code") or "").strip()
+            try:
+                quantity = float(data.get("quantity") or 0)
+                unit_price = float(data.get("unit_price") or 0)
+            except (TypeError, ValueError):
+                skipped.append(f"第{row_number}行：数量或单价格式不正确")
+                continue
+            if not product_code or quantity <= 0:
+                skipped.append(f"第{row_number}行：缺少备件编号或数量")
+                continue
+            product = conn.execute("SELECT * FROM products WHERE code=?", (product_code,)).fetchone()
+            if not product and table == "purchases":
+                product_name = data.get("name") or product_code
+                cursor = conn.execute(
+                    """INSERT INTO products
+                    (code,name,description,unit,current_stock,safe_stock,equipment,part_type,warranty_until,origin,purchase_price,sale_price,remark,created_at,updated_at)
+                    VALUES (?,?,?,?,0,0,?,?,?,?,?,0,?,?,?)""",
+                    (product_code, product_name, data.get("description"), data.get("unit"), data.get("equipment"),
+                     data.get("part_type"), data.get("warranty_until"), data.get("origin"), unit_price,
+                     "采购订单导入自动建立", now_text(), now_text()),
+                )
+                product = conn.execute("SELECT * FROM products WHERE id=?", (cursor.lastrowid,)).fetchone()
+            if not product:
+                skipped.append(f"第{row_number}行：找不到备件 {product_code}")
+                continue
+
+            order_id = created_orders.get(order_no)
+            if not order_id:
+                if conn.execute(f"SELECT 1 FROM {header_table} WHERE order_no=?", (order_no,)).fetchone():
+                    skipped.append(f"第{row_number}行：订单号已存在 {order_no}")
+                    continue
+                order_date = data.get("order_date") or datetime.now().strftime("%Y-%m-%d")
+                if table == "purchases":
+                    data["supplier_id"] = request.form.get("supplier_id") or ""
+                    supplier = find_purchase_supplier(conn, data)
+                    cursor = conn.execute(
+                        """INSERT INTO purchase_order_headers
+                        (order_no,supplier_id,order_date,expected_date,buyer,status,remark,created_at,updated_at)
+                        VALUES (?,?,?,?,?,'pending',?,?,?)""",
+                        (order_no, supplier["id"], order_date, data.get("expected_date") or "", operator,
+                         data.get("remark"), now_text(), now_text()),
+                    )
+                else:
+                    customer_id = request.form.get("customer_id") or ""
+                    customer = conn.execute("SELECT id FROM customers WHERE id=?", (customer_id,)).fetchone() if customer_id else None
+                    if not customer and data.get("customer_code"):
+                        customer = conn.execute("SELECT id FROM customers WHERE code=?", (data["customer_code"],)).fetchone()
+                    customer = customer or get_or_create_default_customer(conn)
+                    cursor = conn.execute(
+                        """INSERT INTO sales_order_headers
+                        (order_no,customer_id,order_date,delivery_date,seller,status,remark,created_at,updated_at)
+                        VALUES (?,?,?,?,?,'pending',?,?,?)""",
+                        (order_no, customer["id"], order_date, data.get("delivery_date") or "", operator,
+                         data.get("remark"), now_text(), now_text()),
+                    )
+                order_id = cursor.lastrowid
+                created_orders[order_no] = order_id
+
+            item_table = "purchase_order_items" if table == "purchases" else "sales_order_items"
+            processed_field = "received_quantity" if table == "purchases" else "shipped_quantity"
+            existing_item = conn.execute(
+                f"SELECT id,quantity FROM {item_table} WHERE order_id=? AND product_id=?", (order_id, product["id"])
+            ).fetchone()
+            if existing_item:
+                new_quantity = existing_item["quantity"] + quantity
+                conn.execute(
+                    f"UPDATE {item_table} SET quantity=?,unit_price=?,amount=? WHERE id=?",
+                    (new_quantity, unit_price, new_quantity * unit_price, existing_item["id"]),
+                )
+            else:
+                conn.execute(
+                    f"""INSERT INTO {item_table}
+                    (order_id,product_id,quantity,unit_price,amount,{processed_field},remark)
+                    VALUES (?,?,?,?,?,0,?)""",
+                    (order_id, product["id"], quantity, unit_price, quantity * unit_price, data.get("remark")),
+                )
+            price_field = "purchase_price" if table == "purchases" else "sale_price"
+            conn.execute(f"UPDATE products SET {price_field}=?,updated_at=? WHERE id=?", (unit_price, now_text(), product["id"]))
+            if table == "sales":
+                customer_id = conn.execute("SELECT customer_id FROM sales_order_headers WHERE id=?", (order_id,)).fetchone()[0]
+                conn.execute("UPDATE customers SET total_sales=total_sales+?,updated_at=? WHERE id=?",
+                             (quantity * unit_price, now_text(), customer_id))
+            imported += 1
+            imported_rows.append(f"第{row_number}行")
+    log_action("导入整单", f"{table} 导入 {imported} 行，形成 {len(created_orders)} 张订单")
+    return jsonify({"ok": True, "count": imported, "order_count": len(created_orders),
+                    "imported_rows": imported_rows[:30], "imported_rows_count": len(imported_rows),
+                    "skipped": skipped[:30], "skipped_count": len(skipped)})
 
 
 @app.get("/api/users")

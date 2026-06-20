@@ -19,8 +19,8 @@ const titles = {
   suppliers: ['供应商管理', '维护供应商资料，支持查询、导入、导出'],
   customers: ['客户管理', '维护客户资料和销售金额'],
   products: ['产品管理', '维护备件资料、安全库存、价格和附件'],
-  purchases: ['采购管理', '新增采购单后自动入库'],
-  sales: ['销售管理', '新增销售单后自动出库，并检查库存'],
+  purchases: ['采购管理', '按整张采购单管理多项备件、分批到货和逾期提醒'],
+  sales: ['销售管理', '按整张销售单管理多项备件和分批发货'],
   stock: ['库存管理', '查看实时库存、预警和库存流水'],
   stats: ['统计分析', '按时间范围查看采购、销售、利润和排行'],
   users: ['用户管理', '管理员维护登录账号和角色'],
@@ -29,10 +29,10 @@ const titles = {
 
 const templateNotes = {
   suppliers: '对应 Excel：采购 → 供应商录入模版。字段顺序：编号、名称、等级、联系人、电话、地址、账户信息、照片、公司资料、公司类型、结算时间。',
-  purchases: '对应 Excel：采购 → 采购订单版。字段顺序：采购单号、供应商、采购日期、备件编号、产品名称、技术描述、单位、数量、单价、合计、照片、应用设备、备件类型、质保时间、产地。',
+  purchases: '一张采购单可包含多项备件。保存订单时不增加库存，确认实际到货后才入库；全部到货后订单锁定。',
   products: '对应 Excel：仓库 → 产品模版。字段顺序：备件编号、产品名称、技术描述、单位、当前库存、安全库存、照片、应用设备、备件类型、质保时间、产地。',
   customers: '对应 Excel：销售 → 客户录入模版。字段顺序：编号、名称、等级、联系人、电话、地址、账户信息、照片、公司资料、公司类型、结算时间、应付金额、实收金额。',
-  sales: '对应 Excel：销售 → 销售订单模版。字段顺序：备件编号、产品名称、技术描述、单位、数量、单价、合计、货期。',
+  sales: '一张销售单可包含多项备件。保存订单时不扣库存，确认实际发货后才出库；全部发货后订单锁定。',
   stats: '对应 Excel：统计 → 可选择时间范围，支持按年、月、周统计，并查看单个产品采购、单个产品销售、单个订单利润、单个客户销售。',
 };
 
@@ -55,15 +55,14 @@ const columns = {
     ['equipment', '应用设备'], ['part_type', '备件类型'], ['warranty_until', '质保时间'], ['origin', '产地']
   ],
   purchases: [
-    ['order_no', '采购单号'], ['supplier_name', '供应商'], ['order_date', '采购日期'],
-    ['product_code', '备件编号'], ['product_name', '产品名称'], ['description', '技术描述'], ['unit', '单位'],
-    ['quantity', '数量'], ['unit_price', '单价'], ['amount', '合计'], ['photo_path', '照片'],
-    ['equipment', '应用设备'], ['part_type', '备件类型'], ['warranty_until', '质保时间'], ['origin', '产地']
+    ['order_no', '采购单号'], ['supplier_name', '供应商'], ['order_date', '采购日期'], ['expected_date', '要求到货日期'],
+    ['item_count', '备件项数'], ['total_quantity', '采购数量'], ['processed_quantity', '已到货'],
+    ['amount', '订单金额'], ['status_text', '状态']
   ],
   sales: [
-    ['product_code', '备件编号'], ['product_name', '产品名称'], ['description', '技术描述'], ['unit', '单位'],
-    ['quantity', '数量'], ['unit_price', '单价'], ['amount', '合计'], ['delivery_date', '货期'],
-    ['order_no', '销售单号'], ['customer_name', '客户'], ['order_date', '销售日期'], ['status', '状态']
+    ['order_no', '销售单号'], ['customer_name', '客户'], ['order_date', '销售日期'], ['delivery_date', '要求发货日期'],
+    ['item_count', '备件项数'], ['total_quantity', '销售数量'], ['processed_quantity', '已发货'],
+    ['amount', '订单金额'], ['status_text', '状态']
   ],
   users: [
     ['username', '用户名'], ['display_name', '显示名称'], ['role', '角色'], ['created_at', '创建时间']
@@ -163,7 +162,7 @@ function tableHtml(cols, rows, options = {}) {
 function mountToolbar(view) {
   const tpl = $('#toolbarTemplate').content.cloneNode(true);
   const toolbar = tpl.querySelector('.toolbar');
-  if (!['suppliers', 'customers', 'products'].includes(view)) {
+  if (!['suppliers', 'customers', 'products', 'purchases', 'sales'].includes(view)) {
     toolbar.querySelector('.search').remove();
     toolbar.querySelector('.searchBtn').remove();
   }
@@ -211,6 +210,8 @@ async function renderDashboard() {
       ${card('本月销售额', money(c.month_sales))}
       ${card('本月利润', money(c.month_profit))}
       ${card('库存不足产品', c.low_stock, c.low_stock > 0)}
+      ${card('采购逾期未到货', c.overdue_purchases, c.overdue_purchases > 0)}
+      ${card('销售逾期未发货', c.overdue_sales, c.overdue_sales > 0)}
     </div>
     <div class="panel">
       <h2>库存预警</h2>
@@ -269,39 +270,186 @@ function renderRows(view, rows) {
 async function renderOrders(view) {
   await refreshLookups();
   const data = await api(`/api/${view}`);
+  data.items.forEach(row => {
+    const statusMap = { pending: '待处理', partial: view === 'purchases' ? '部分到货' : '部分发货', completed: '已完成', cancelled: '已作废' };
+    row.status_text = `${statusMap[row.status] || row.status}${row.overdue ? '（已逾期）' : ''}`;
+  });
   const content = $('#content');
   content.innerHTML = '';
   if (templateNotes[view]) {
     content.insertAdjacentHTML('beforeend', `<div class="panel"><strong>模板对应：</strong>${templateNotes[view]}</div>`);
   }
   const toolbar = mountToolbar(view);
-  toolbar.querySelector('.newBtn').onclick = () => openForm(view);
+  toolbar.querySelector('.newBtn').onclick = () => openOrderForm(view);
+  toolbar.querySelector('.searchBtn').onclick = async () => {
+    const result = await api(`/api/${view}?q=${encodeURIComponent(toolbar.querySelector('.search').value)}`);
+    result.items.forEach(row => {
+      const statusMap = { pending: '待处理', partial: view === 'purchases' ? '部分到货' : '部分发货', completed: '已完成', cancelled: '已作废' };
+      row.status_text = `${statusMap[row.status] || row.status}${row.overdue ? '（已逾期）' : ''}`;
+    });
+    renderOrderTable(view, result.items);
+  };
   const exportBtn = toolbar.querySelector('.exportBtn');
   if (exportBtn) exportBtn.onclick = () => location.href = `/api/export/${view}`;
   content.appendChild(toolbar);
   if (canEditBase()) {
+    const isPurchase = view === 'purchases';
     const importPanel = document.createElement('div');
-    importPanel.className = 'panel';
-    const name = view === 'purchases' ? '采购订单' : '销售订单';
-    const extra = view === 'purchases' ? '按 Excel 的“采购订单版”字段导入。Excel 里可以填写采购单号、供应商、采购日期；如果供应商不填，系统会自动归到“未指定供应商”。' : '按 Excel 的“销售订单模版”字段导入。可在这里选择客户；如果不选，系统会自动使用“未指定客户”。库存不足的行会跳过。';
-    const supplierSelect = view === 'purchases' ? `<select id="importSupplierId"><option value="">选择供应商（采购导入用）</option>${state.suppliers.map(item => `<option value="${item.id}">${item.code} - ${item.name}</option>`).join('')}</select>` : '';
-    const customerSelect = view === 'sales' ? `<select id="importCustomerId"><option value="">选择客户（销售导入用）</option>${state.customers.map(item => `<option value="${item.id}">${item.code} - ${item.name}</option>`).join('')}</select>` : '';
-    importPanel.innerHTML = `<strong>${name}批量导入</strong><p>${extra}</p>${supplierSelect}${customerSelect}<input type="file" id="importFile"><button id="importBtn">导入</button>`;
+    importPanel.className = 'panel order-import';
+    importPanel.innerHTML = `<strong>整单 Excel 导入</strong><p>Excel 中相同订单号的多行会合并成一张订单。导入后不会直接改变库存，仍需人工确认${isPurchase ? '到货' : '发货'}。</p>
+      <div class="toolbar"><select id="importPartyId"><option value="">${isPurchase ? '选择供应商（Excel未填写时使用）' : '选择客户'}</option>${(isPurchase ? state.suppliers : state.customers).map(item => `<option value="${item.id}">${item.code} - ${item.name}</option>`).join('')}</select><input type="file" id="importFile" accept=".xlsx,.xlsm,.csv"><button id="importBtn">导入整单</button></div>`;
     content.appendChild(importPanel);
     importPanel.querySelector('#importBtn').onclick = () => importData(view);
   }
-  content.insertAdjacentHTML('beforeend', tableHtml(columns[view], data.items, {
+  content.insertAdjacentHTML('beforeend', '<div id="orderTableHolder"></div>');
+  renderOrderTable(view, data.items);
+}
+
+function renderOrderTable(view, rows) {
+  $('#orderTableHolder').innerHTML = tableHtml(columns[view], rows, {
     actions: (row) => `
-      ${view === 'purchases' && canEditBase() ? `<button onclick='openForm("${view}", ${JSON.stringify(row)})'>修改</button>` : ''}
-      ${view === 'sales' && canEditBase() && row.status !== 'voided' ? `<button onclick='openForm("${view}", ${JSON.stringify(row)})'>修改</button><button class="danger" onclick='voidSalesOrder(${row.id})'>作废</button>` : ''}
+      <button onclick='viewOrder("${view}", ${JSON.stringify(row)})'>查看明细</button>
+      ${row.status === 'pending' && canEditBase() ? `<button onclick='openOrderForm("${view}", ${JSON.stringify(row)})'>修改</button>` : ''}
+      ${!['completed', 'cancelled'].includes(row.status) ? `<button class="primary" onclick='openProgressForm("${view}", ${JSON.stringify(row)})'>${view === 'purchases' ? '确认到货' : '确认发货'}</button>` : ''}
       <button onclick='printOrder("${view}", ${JSON.stringify(row)})'>打印</button>
     `
+  });
+  rows.forEach((row, index) => {
+    if (row.overdue) $('#orderTableHolder tbody').rows[index]?.classList.add('overdue-row');
+  });
+}
+
+function orderPartyOptions(view, selected) {
+  const items = view === 'purchases' ? state.suppliers : state.customers;
+  return items.map(item => `<option value="${item.id}" ${Number(selected) === Number(item.id) ? 'selected' : ''}>${item.code} - ${item.name}</option>`).join('');
+}
+
+async function openOrderForm(view, row = null) {
+  await refreshLookups();
+  const isPurchase = view === 'purchases';
+  const today = new Date().toISOString().slice(0, 10);
+  $('#modalTitle').textContent = row ? `修改${isPurchase ? '采购' : '销售'}整单` : `新增${isPurchase ? '采购' : '销售'}整单`;
+  const form = $('#modalForm');
+  form.innerHTML = `
+    <label>订单号<input name="order_no" value="${row?.order_no || ''}" placeholder="留空自动生成"></label>
+    <label>${isPurchase ? '供应商' : '客户'}<select name="${isPurchase ? 'supplier_id' : 'customer_id'}" required><option value="">请选择</option>${orderPartyOptions(view, row?.[isPurchase ? 'supplier_id' : 'customer_id'])}</select></label>
+    <label>${isPurchase ? '采购' : '销售'}日期<input name="order_date" type="date" value="${row?.order_date || today}" required></label>
+    <label>${isPurchase ? '要求到货日期' : '要求发货日期'}<input name="${isPurchase ? 'expected_date' : 'delivery_date'}" type="date" value="${row?.[isPurchase ? 'expected_date' : 'delivery_date'] || ''}" required></label>
+    <label class="wide">备注<textarea name="remark">${row?.remark || ''}</textarea></label>
+    <div class="wide order-lines-head"><h3>备件明细</h3><button type="button" id="addOrderLine" class="primary">增加备件</button></div>
+    <div id="orderLines" class="wide order-lines"></div>
+    <div class="wide order-total">订单合计：<strong id="orderTotal">0.00</strong></div>
+    <div class="form-actions"><button type="button" id="cancelBtn">取消</button><button class="primary" type="submit">保存整单</button></div>`;
+  $('#modal').classList.remove('hidden');
+  $('#cancelBtn').onclick = closeModal;
+  $('#addOrderLine').onclick = () => addOrderLine(view);
+  (row?.items?.length ? row.items : [{}]).forEach(item => addOrderLine(view, item));
+  form.onsubmit = event => saveOrder(event, view, row);
+}
+
+function addOrderLine(view, item = {}) {
+  const holder = $('#orderLines');
+  const line = document.createElement('div');
+  line.className = 'order-line';
+  const options = state.products.map(product => `<option value="${product.id}" ${Number(item.product_id) === Number(product.id) ? 'selected' : ''}>${product.code} - ${product.name}</option>`).join('');
+  line.innerHTML = `
+    <label>备件编号<select class="line-product" required><option value="">请选择备件编号</option>${options}</select></label>
+    <label>产品名称<input class="line-name" value="${item.product_name || ''}" readonly></label>
+    <label>单位<input class="line-unit" value="${item.unit || ''}" readonly></label>
+    <label>数量<input class="line-quantity" type="number" min="0.0001" step="any" value="${item.quantity || ''}" required></label>
+    <label>单价<input class="line-price" type="number" min="0" step="any" value="${item.unit_price ?? ''}" required></label>
+    <label>金额<input class="line-amount" value="${item.amount ? money(item.amount) : ''}" readonly></label>
+    <label>明细备注<input class="line-remark" value="${item.remark || ''}"></label>
+    <button type="button" class="danger line-remove" title="删除这条备件">删除</button>`;
+  holder.appendChild(line);
+  const productSelect = line.querySelector('.line-product');
+  const updateProduct = () => {
+    const product = state.products.find(p => Number(p.id) === Number(productSelect.value));
+    line.querySelector('.line-name').value = product?.name || '';
+    line.querySelector('.line-unit').value = product?.unit || '';
+    if (!line.querySelector('.line-price').value && product) {
+      line.querySelector('.line-price').value = view === 'purchases' ? product.purchase_price || 0 : product.sale_price || 0;
+    }
+    updateOrderTotal();
+  };
+  productSelect.onchange = updateProduct;
+  line.querySelector('.line-quantity').oninput = updateOrderTotal;
+  line.querySelector('.line-price').oninput = updateOrderTotal;
+  line.querySelector('.line-remove').onclick = () => { line.remove(); updateOrderTotal(); };
+  if (item.product_id) updateProduct();
+  updateOrderTotal();
+}
+
+function updateOrderTotal() {
+  let total = 0;
+  document.querySelectorAll('#orderLines .order-line').forEach(line => {
+    const amount = Number(line.querySelector('.line-quantity').value || 0) * Number(line.querySelector('.line-price').value || 0);
+    line.querySelector('.line-amount').value = money(amount);
+    total += amount;
+  });
+  if ($('#orderTotal')) $('#orderTotal').textContent = money(total);
+}
+
+async function saveOrder(event, view, row) {
+  event.preventDefault();
+  const form = event.target;
+  const data = Object.fromEntries(new FormData(form));
+  data.items = Array.from(form.querySelectorAll('.order-line')).map(line => ({
+    product_id: line.querySelector('.line-product').value,
+    quantity: line.querySelector('.line-quantity').value,
+    unit_price: line.querySelector('.line-price').value,
+    remark: line.querySelector('.line-remark').value,
   }));
+  try {
+    const result = await api(row ? `/api/${view}/${row.id}` : `/api/${view}`, {
+      method: row ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    });
+    closeModal();
+    showMessage(`整单保存成功，单号：${result.order_no}`, true);
+    await loadView();
+  } catch (error) { showMessage(error.message); }
+}
+
+function orderDetailTable(row, view, progress = false) {
+  const actionLabel = view === 'purchases' ? '本次到货' : '本次发货';
+  const processedLabel = view === 'purchases' ? '已到货' : '已发货';
+  return `<div class="table-wrap"><table class="detail-table"><thead><tr><th>备件编号</th><th>产品名称</th><th>单位</th><th>订购数量</th><th>${processedLabel}</th><th>未完成</th><th>单价</th><th>金额</th>${progress ? `<th>${actionLabel}</th>` : ''}</tr></thead><tbody>${row.items.map(item => `<tr><td>${item.product_code}</td><td>${item.product_name}</td><td>${item.unit || ''}</td><td>${item.quantity}</td><td>${item.processed_quantity}</td><td>${item.remaining_quantity}</td><td>${money(item.unit_price)}</td><td>${money(item.amount)}</td>${progress ? `<td><input class="progress-qty" data-item-id="${item.id}" type="number" min="0" max="${item.remaining_quantity}" step="any" value="0" ${Number(item.remaining_quantity) <= 0 ? 'disabled' : ''}></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+}
+
+function viewOrder(view, row) {
+  $('#modalTitle').textContent = `${view === 'purchases' ? '采购' : '销售'}单 ${row.order_no}`;
+  $('#modalForm').innerHTML = `<div class="wide order-summary"><strong>${view === 'purchases' ? row.supplier_name : row.customer_name}</strong><span>订单日期：${row.order_date}</span><span>${view === 'purchases' ? '到货要求' : '发货要求'}：${row[view === 'purchases' ? 'expected_date' : 'delivery_date'] || '-'}</span><span>状态：${row.status_text}</span></div><div class="wide">${orderDetailTable(row, view)}</div><div class="form-actions"><button type="button" id="cancelBtn">关闭</button></div>`;
+  $('#modal').classList.remove('hidden');
+  $('#cancelBtn').onclick = closeModal;
+}
+
+function openProgressForm(view, row) {
+  const isPurchase = view === 'purchases';
+  $('#modalTitle').textContent = `${isPurchase ? '确认到货入库' : '确认发货出库'}：${row.order_no}`;
+  const form = $('#modalForm');
+  form.innerHTML = `<div class="wide progress-note">只填写本次实际${isPurchase ? '到货' : '发货'}数量。系统会保留未完成数量，下次可以继续处理。</div><div class="wide">${orderDetailTable(row, view, true)}</div><label class="wide">本次备注<textarea name="remark"></textarea></label><div class="form-actions"><button type="button" id="fillRemainingBtn">全部填入未完成数量</button><button type="button" id="cancelBtn">取消</button><button class="primary" type="submit">确认${isPurchase ? '入库' : '出库'}</button></div>`;
+  $('#modal').classList.remove('hidden');
+  $('#cancelBtn').onclick = closeModal;
+  $('#fillRemainingBtn').onclick = () => form.querySelectorAll('.progress-qty').forEach(input => { if (!input.disabled) input.value = input.max; });
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const items = Array.from(form.querySelectorAll('.progress-qty')).map(input => ({ item_id: input.dataset.itemId, quantity: input.value }));
+    try {
+      const result = await api(`/api/${view}/${row.id}/${isPurchase ? 'receive' : 'ship'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items, remark: form.elements.remark.value }) });
+      closeModal();
+      showMessage(`${isPurchase ? '到货入库' : '发货出库'}成功：${result.order_no}`, true);
+      await loadView();
+    } catch (error) { showMessage(error.message); }
+  };
 }
 
 async function renderStock() {
   await refreshLookups();
-  const data = await api('/api/stock');
+  const [data, purchases, sales] = await Promise.all([api('/api/stock'), api('/api/purchases'), api('/api/sales')]);
+  const pendingPurchases = purchases.items.filter(row => !['completed', 'cancelled'].includes(row.status));
+  const pendingSales = sales.items.filter(row => !['completed', 'cancelled'].includes(row.status));
+  pendingPurchases.forEach(row => row.status_text = `${row.status === 'partial' ? '部分到货' : '待到货'}${row.overdue ? '（已逾期）' : ''}`);
+  pendingSales.forEach(row => row.status_text = `${row.status === 'partial' ? '部分发货' : '待发货'}${row.overdue ? '（已逾期）' : ''}`);
   $('#content').innerHTML = `
     <div class="panel"><strong>模板对应：</strong>${templateNotes.products}</div>
     <div class="toolbar">
@@ -317,10 +465,14 @@ async function renderStock() {
       <input type="file" id="importFile" accept=".xlsx,.xlsm,.csv">
       <button id="importBtn">导入</button>
     </div>
+    <div class="panel"><h2>待到货采购单</h2><p>打开整单，填写本次实际到货数量；第一次确认后单据内容立即锁定。</p><div id="stockPurchaseOrders"></div></div>
+    <div class="panel"><h2>待发货销售单</h2><p>发货时检查实时库存；第一次确认后单据内容立即锁定。</p><div id="stockSalesOrders"></div></div>
     <h2>实时库存</h2>
     ${tableHtml(columns.products, data.items)}
     <div class="panel"><h2>最近库存流水</h2>${tableHtml([['movement_time','时间'],['movement_type','类型'],['product_code','编号'],['product_name','产品'],['quantity','数量'],['operator','操作人'],['source_no','来源单号'],['remark','备注']], data.movements)}</div>
   `;
+  $('#stockPurchaseOrders').innerHTML = stockOrderTable('purchases', pendingPurchases);
+  $('#stockSalesOrders').innerHTML = stockOrderTable('sales', pendingSales);
   $('#stockSearchBtn').onclick = async () => {
     const result = await api(`/api/stock?q=${encodeURIComponent($('#stockSearch').value)}`);
     $('#content').querySelector('.table-wrap').outerHTML = tableHtml(columns.products, result.items);
@@ -329,6 +481,14 @@ async function renderStock() {
   $('#stockImportPanel').querySelector('#importBtn').onclick = () => importData('products');
   $('#manualStockBtn').onclick = () => openForm('stockManual');
   applyRole();
+}
+
+function stockOrderTable(view, rows) {
+  const isPurchase = view === 'purchases';
+  const cols = isPurchase
+    ? [['order_no','采购单号'],['supplier_name','供应商'],['expected_date','要求到货日期'],['total_quantity','总数量'],['processed_quantity','已到货'],['status_text','状态']]
+    : [['order_no','销售单号'],['customer_name','客户'],['delivery_date','要求发货日期'],['total_quantity','总数量'],['processed_quantity','已发货'],['status_text','状态']];
+  return tableHtml(cols, rows, { actions: row => `<button onclick='viewOrder("${view}", ${JSON.stringify(row)})'>查看明细</button><button class="primary" onclick='openProgressForm("${view}", ${JSON.stringify(row)})'>${isPurchase ? '确认到货' : '确认发货'}</button>` });
 }
 
 async function renderStats() {
@@ -547,6 +707,8 @@ async function importData(view) {
   if (supplierSelect && supplierSelect.value) form.append('supplier_id', supplierSelect.value);
   const customerSelect = $('#importCustomerId');
   if (customerSelect && customerSelect.value) form.append('customer_id', customerSelect.value);
+  const partySelect = $('#importPartyId');
+  if (partySelect && partySelect.value) form.append(view === 'purchases' ? 'supplier_id' : 'customer_id', partySelect.value);
   try {
     const result = await api(`/api/import/${view}`, { method: 'POST', body: form });
     const successText = result.imported_rows_count ? `（${result.imported_rows.join('、')}${result.imported_rows_count > result.imported_rows.length ? '等' : ''}）` : '';
@@ -621,11 +783,15 @@ async function deleteSupplierAttachment(attachmentId, supplierId, supplierName) 
 
 function printOrder(view, row) {
   const title = view === 'purchases' ? '采购单' : '销售单';
+  const party = view === 'purchases' ? row.supplier_name : row.customer_name;
+  const dateLabel = view === 'purchases' ? '要求到货日期' : '要求发货日期';
+  const requiredDate = row[view === 'purchases' ? 'expected_date' : 'delivery_date'] || '';
   const html = `
     <html><head><title>${title}${row.order_no}</title><style>body{font-family:Arial,"Microsoft YaHei";padding:30px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:8px;text-align:left}</style></head>
-    <body><h1>${title}</h1><table>
-    ${Object.entries(row).filter(([key]) => !['id','created_at','updated_at'].includes(key)).map(([key, value]) => `<tr><th>${key}</th><td>${value ?? ''}</td></tr>`).join('')}
-    </table><script>window.print()</script></body></html>`;
+    <body><h1>${title} ${row.order_no}</h1><p>${view === 'purchases' ? '供应商' : '客户'}：${party}　订单日期：${row.order_date}　${dateLabel}：${requiredDate}</p>
+    <table><thead><tr><th>备件编号</th><th>产品名称</th><th>技术描述</th><th>单位</th><th>数量</th><th>${view === 'purchases' ? '已到货' : '已发货'}</th><th>单价</th><th>金额</th></tr></thead><tbody>
+    ${row.items.map(item => `<tr><td>${item.product_code}</td><td>${item.product_name}</td><td>${item.description || ''}</td><td>${item.unit || ''}</td><td>${item.quantity}</td><td>${item.processed_quantity}</td><td>${money(item.unit_price)}</td><td>${money(item.amount)}</td></tr>`).join('')}
+    </tbody></table><p>订单金额：${money(row.amount)}　状态：${row.status_text}</p><script>window.print()</script></body></html>`;
   const win = window.open('', '_blank');
   win.document.write(html);
   win.document.close();
