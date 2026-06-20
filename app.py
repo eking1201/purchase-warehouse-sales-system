@@ -2439,11 +2439,19 @@ def import_table(table: str):
         for row_number, item in enumerate(rows, start=1):
             data = {field: import_value(item, field) for field in fields}
             if table == "suppliers":
-                name = import_value(item, "name")
+                name = str(import_value(item, "name") or "").strip()
                 if not name:
+                    skipped.append(f"第{row_number}行：缺少供应商名称")
                     continue
                 data["name"] = name
-                code = import_value(item, "code") or next_code(conn, table, "SUP")
+                code = str(import_value(item, "code") or "").strip()
+                duplicate = conn.execute(
+                    "SELECT code,name FROM suppliers WHERE code=? OR name=?", (code, name)
+                ).fetchone() if code else conn.execute("SELECT code,name FROM suppliers WHERE name=?", (name,)).fetchone()
+                if duplicate:
+                    skipped.append(f"第{row_number}行：供应商已存在 {duplicate['code']} - {duplicate['name']}")
+                    continue
+                code = code or next_code(conn, table, "SUP")
                 conn.execute(
                     """
                     INSERT INTO suppliers (code,name,level,contact,phone,address,account_info,company_type,settlement,remark,created_at,updated_at)
@@ -2452,32 +2460,60 @@ def import_table(table: str):
                     (code, data["name"], data.get("level"), data.get("contact"), data.get("phone"), data.get("address"), data.get("account_info"), data.get("company_type"), data.get("settlement"), data.get("remark"), now_text(), now_text()),
                 )
             elif table == "customers":
-                name = import_value(item, "name")
+                name = str(import_value(item, "name") or "").strip()
                 if not name:
+                    skipped.append(f"第{row_number}行：缺少客户名称")
                     continue
                 data["name"] = name
-                code = import_value(item, "code") or next_code(conn, table, "CUS")
+                code = str(import_value(item, "code") or "").strip()
+                duplicate = conn.execute(
+                    "SELECT code,name FROM customers WHERE code=? OR name=?", (code, name)
+                ).fetchone() if code else conn.execute("SELECT code,name FROM customers WHERE name=?", (name,)).fetchone()
+                if duplicate:
+                    skipped.append(f"第{row_number}行：客户已存在 {duplicate['code']} - {duplicate['name']}")
+                    continue
+                code = code or next_code(conn, table, "CUS")
+                try:
+                    total_sales = float(data.get("total_sales") or 0)
+                    received_amount = float(data.get("received_amount") or 0)
+                except (TypeError, ValueError):
+                    skipped.append(f"第{row_number}行：应付金额或实收金额格式不正确")
+                    continue
                 conn.execute(
                     """
                     INSERT INTO customers (code,name,level,contact,phone,address,account_info,company_type,settlement,total_sales,received_amount,remark,created_at,updated_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (code, data["name"], data.get("level"), data.get("contact"), data.get("phone"), data.get("address"), data.get("account_info"), data.get("company_type"), data.get("settlement"), float(data.get("total_sales") or 0), float(data.get("received_amount") or 0), data.get("remark"), now_text(), now_text()),
+                    (code, data["name"], data.get("level"), data.get("contact"), data.get("phone"), data.get("address"), data.get("account_info"), data.get("company_type"), data.get("settlement"), total_sales, received_amount, data.get("remark"), now_text(), now_text()),
                 )
             elif table == "products":
-                name = import_value(item, "name")
+                name = str(import_value(item, "name") or "").strip()
                 if not name:
+                    skipped.append(f"第{row_number}行：缺少产品名称")
                     continue
                 data["name"] = name
-                code = import_value(item, "code")
+                code = str(import_value(item, "code") or "").strip()
                 if not code:
+                    skipped.append(f"第{row_number}行：缺少备件编号")
+                    continue
+                duplicate = conn.execute("SELECT code,name FROM products WHERE code=?", (code,)).fetchone()
+                if duplicate:
+                    skipped.append(f"第{row_number}行：备件编号已存在 {duplicate['code']} - {duplicate['name']}，未覆盖现有库存")
+                    continue
+                try:
+                    current_stock = float(data.get("current_stock") or 0)
+                    safe_stock = float(data.get("safe_stock") or 0)
+                    purchase_price = float(data.get("purchase_price") or 0)
+                    sale_price = float(data.get("sale_price") or 0)
+                except (TypeError, ValueError):
+                    skipped.append(f"第{row_number}行：库存或价格格式不正确")
                     continue
                 conn.execute(
                     """
                     INSERT INTO products (code,name,description,unit,current_stock,safe_stock,equipment,part_type,warranty_until,origin,purchase_price,sale_price,remark,created_at,updated_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (code, data["name"], data.get("description"), data.get("unit"), float(data.get("current_stock") or 0), float(data.get("safe_stock") or 0), data.get("equipment"), data.get("part_type"), data.get("warranty_until"), data.get("origin"), float(data.get("purchase_price") or 0), float(data.get("sale_price") or 0), data.get("remark"), now_text(), now_text()),
+                    (code, data["name"], data.get("description"), data.get("unit"), current_stock, safe_stock, data.get("equipment"), data.get("part_type"), data.get("warranty_until"), data.get("origin"), purchase_price, sale_price, data.get("remark"), now_text(), now_text()),
                 )
             elif table == "purchases":
                 data["supplier_id"] = request.form.get("supplier_id") or ""

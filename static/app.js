@@ -1002,7 +1002,7 @@ async function importData(view) {
     const result = await api(`/api/import/${view}`, { method: 'POST', body: form });
     const successText = result.imported_rows_count ? `（${result.imported_rows.join('、')}${result.imported_rows_count > result.imported_rows.length ? '等' : ''}）` : '';
     const skippedText = result.skipped_count ? `；跳过 ${result.skipped_count} 条：${result.skipped.join('；')}` : '';
-    showMessage(`导入成功：${result.count} 条${successText}${skippedText}`, result.count > 0);
+    showMessage(`导入完成：新增 ${result.count} 条${successText}${skippedText}`, true);
     await loadView();
   } catch (error) {
     showMessage(error.message);
