@@ -329,6 +329,8 @@ def execute_schema() -> None:
                 shipping_unit TEXT NOT NULL,
                 shipping_contact TEXT,
                 shipping_phone TEXT,
+                sender_contact TEXT,
+                sender_phone TEXT,
                 sender_address TEXT,
                 shipping_address TEXT,
                 delivery_date TEXT,
@@ -360,6 +362,8 @@ def execute_schema() -> None:
                 delivery_date TEXT NOT NULL,
                 shipping_unit TEXT NOT NULL,
                 sender_address TEXT,
+                sender_contact TEXT,
+                sender_phone TEXT,
                 receiving_unit TEXT NOT NULL,
                 receiver_contact TEXT,
                 receiver_phone TEXT,
@@ -371,7 +375,9 @@ def execute_schema() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 confirmed_at TEXT,
-                FOREIGN KEY(sales_order_id) REFERENCES sales_order_headers(id)
+                project_id INTEGER,
+                FOREIGN KEY(sales_order_id) REFERENCES sales_order_headers(id),
+                FOREIGN KEY(project_id) REFERENCES projects(id)
             );
 
             CREATE TABLE IF NOT EXISTS delivery_note_items (
@@ -398,6 +404,102 @@ def execute_schema() -> None:
                 FOREIGN KEY(product_id) REFERENCES products(id)
             );
 
+            -- 长周期维修/工程项目：发货来自仓库，人工、差旅等费用单独记录。
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_no TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                customer_id INTEGER NOT NULL,
+                description TEXT,
+                start_date TEXT NOT NULL,
+                planned_end_date TEXT,
+                actual_end_date TEXT,
+                budget_amount REAL NOT NULL DEFAULT 0,
+                contract_amount REAL NOT NULL DEFAULT 0,
+                warranty_end_date TEXT,
+                warranty_terms TEXT,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','completed','cancelled')),
+                remark TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(customer_id) REFERENCES customers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS project_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                expense_date TEXT NOT NULL,
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 1,
+                unit_price REAL NOT NULL DEFAULT 0,
+                amount REAL NOT NULL DEFAULT 0,
+                reference_no TEXT,
+                remark TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS project_travel_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                depart_date TEXT NOT NULL,
+                return_date TEXT,
+                traveler TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                transport_cost REAL NOT NULL DEFAULT 0,
+                accommodation_cost REAL NOT NULL DEFAULT 0,
+                meal_cost REAL NOT NULL DEFAULT 0,
+                allowance_cost REAL NOT NULL DEFAULT 0,
+                other_cost REAL NOT NULL DEFAULT 0,
+                amount REAL NOT NULL DEFAULT 0,
+                receipt_no TEXT,
+                remark TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS project_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                payment_date TEXT NOT NULL,
+                stage TEXT,
+                amount REAL NOT NULL,
+                method TEXT,
+                remark TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS project_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                event_date TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT,
+                follow_up TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS project_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_type TEXT,
+                uploaded_by TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS system_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 log_time TEXT NOT NULL,
@@ -414,6 +516,17 @@ def execute_schema() -> None:
         quotation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(quotations)")}
         if "sender_address" not in quotation_columns:
             conn.execute("ALTER TABLE quotations ADD COLUMN sender_address TEXT")
+        if "sender_contact" not in quotation_columns:
+            conn.execute("ALTER TABLE quotations ADD COLUMN sender_contact TEXT")
+        if "sender_phone" not in quotation_columns:
+            conn.execute("ALTER TABLE quotations ADD COLUMN sender_phone TEXT")
+        delivery_columns = {row["name"] for row in conn.execute("PRAGMA table_info(delivery_notes)")}
+        if "project_id" not in delivery_columns:
+            conn.execute("ALTER TABLE delivery_notes ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+        if "sender_contact" not in delivery_columns:
+            conn.execute("ALTER TABLE delivery_notes ADD COLUMN sender_contact TEXT")
+        if "sender_phone" not in delivery_columns:
+            conn.execute("ALTER TABLE delivery_notes ADD COLUMN sender_phone TEXT")
         migrate_legacy_orders(conn)
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             conn.execute(
@@ -831,6 +944,11 @@ def dashboard():
             """SELECT COUNT(*) FROM sales_order_headers WHERE status NOT IN ('completed','cancelled') AND delivery_date!=''
                AND date(delivery_date)<date('now','localtime')"""
         ).fetchone()[0]
+        active_projects = conn.execute("SELECT COUNT(*) FROM projects WHERE status='active'").fetchone()[0]
+        overdue_projects = conn.execute(
+            """SELECT COUNT(*) FROM projects WHERE status='active' AND planned_end_date!=''
+               AND date(planned_end_date)<date('now','localtime')"""
+        ).fetchone()[0]
     return jsonify({
         "ok": True,
         "cards": {
@@ -845,6 +963,8 @@ def dashboard():
             "warranty_soon": warranty_soon,
             "overdue_purchases": overdue_purchases,
             "overdue_sales": overdue_sales,
+            "active_projects": active_projects,
+            "overdue_projects": overdue_projects,
         },
         "low_stock_items": recent_low,
     })
@@ -1897,9 +2017,15 @@ def quotations_list():
         default_sender_address = conn.execute(
             "SELECT sender_address FROM quotations WHERE sender_address IS NOT NULL AND sender_address!='' ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        default_sender = conn.execute(
+            """SELECT sender_contact,sender_phone FROM quotations
+               WHERE COALESCE(sender_contact,'')!='' OR COALESCE(sender_phone,'')!='' ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
     return jsonify({"ok": True, "items": rows,
                     "default_company_name": default_company_name[0] if default_company_name else "",
-                    "default_sender_address": default_sender_address[0] if default_sender_address else ""})
+                    "default_sender_address": default_sender_address[0] if default_sender_address else "",
+                    "default_sender_contact": default_sender["sender_contact"] if default_sender else "",
+                    "default_sender_phone": default_sender["sender_phone"] if default_sender else ""})
 
 
 @app.post("/api/quotations")
@@ -1930,12 +2056,14 @@ def quotation_create():
             """
             INSERT INTO quotations
             (quote_no,customer_id,quote_date,validity_date,own_company_name,shipping_unit,shipping_contact,
-             shipping_phone,sender_address,shipping_address,delivery_date,delivery_method,status,remark,created_by,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)
+             shipping_phone,sender_contact,sender_phone,sender_address,shipping_address,delivery_date,delivery_method,
+             status,remark,created_by,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)
             """,
             (quote_no, customer["id"], data.get("quote_date") or datetime.now().strftime("%Y-%m-%d"),
              data.get("validity_date") or "", own_company_name, shipping_unit, data.get("shipping_contact") or "",
-             data.get("shipping_phone") or "", sender_address, data.get("shipping_address") or "", data.get("delivery_date") or "",
+             data.get("shipping_phone") or "", data.get("sender_contact") or "", data.get("sender_phone") or "",
+             sender_address, data.get("shipping_address") or "", data.get("delivery_date") or "",
              data.get("delivery_method") or "", data.get("remark") or "", user["display_name"], now_text(), now_text()),
         )
         for item in items:
@@ -1972,11 +2100,13 @@ def quotation_update(quotation_id: int):
             return jsonify({"ok": False, "message": "报价单号已存在"}), 400
         conn.execute(
             """UPDATE quotations SET quote_no=?,customer_id=?,quote_date=?,validity_date=?,own_company_name=?,
-               shipping_unit=?,shipping_contact=?,shipping_phone=?,sender_address=?,shipping_address=?,delivery_date=?,delivery_method=?,
+               shipping_unit=?,shipping_contact=?,shipping_phone=?,sender_contact=?,sender_phone=?,sender_address=?,
+               shipping_address=?,delivery_date=?,delivery_method=?,
                remark=?,updated_at=? WHERE id=?""",
             (quote_no, customer["id"], data.get("quote_date") or quotation["quote_date"], data.get("validity_date") or "",
              own_company_name, shipping_unit, data.get("shipping_contact") or "", data.get("shipping_phone") or "",
-             sender_address, data.get("shipping_address") or "", data.get("delivery_date") or "", data.get("delivery_method") or "",
+             data.get("sender_contact") or "", data.get("sender_phone") or "", sender_address,
+             data.get("shipping_address") or "", data.get("delivery_date") or "", data.get("delivery_method") or "",
              data.get("remark") or "", now_text(), quotation_id),
         )
         conn.execute("DELETE FROM quotation_items WHERE quotation_id=?", (quotation_id,))
@@ -2001,11 +2131,450 @@ def quotation_delete(quotation_id: int):
     return jsonify({"ok": True})
 
 
+def project_summary_rows(conn: sqlite3.Connection, where: str = "", params: list | tuple = ()) -> list[dict]:
+    """项目金额统一在这里计算，避免列表和详情口径不一致。"""
+    rows = rows_to_list(conn.execute(
+        f"""
+        SELECT p.*,c.code AS customer_code,c.name AS customer_name,
+               COALESCE((SELECT COUNT(*) FROM delivery_notes dn
+                         WHERE dn.project_id=p.id AND dn.status='confirmed'),0) AS delivery_count,
+               COALESCE((SELECT SUM(dni.quantity*soi.unit_price)
+                         FROM delivery_notes dn
+                         JOIN delivery_note_items dni ON dni.delivery_note_id=dn.id
+                         JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id
+                         WHERE dn.project_id=p.id AND dn.status='confirmed'),0) AS shipped_amount,
+               COALESCE((SELECT SUM(pe.amount) FROM project_expenses pe WHERE pe.project_id=p.id),0) AS general_cost,
+               COALESCE((SELECT SUM(pt.amount) FROM project_travel_expenses pt WHERE pt.project_id=p.id),0) AS travel_cost,
+               COALESCE((SELECT SUM(pp.amount) FROM project_payments pp WHERE pp.project_id=p.id),0) AS received_amount
+        FROM projects p JOIN customers c ON c.id=p.customer_id
+        {where}
+        ORDER BY CASE p.status WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END,p.id DESC
+        """, params
+    ))
+    for row in rows:
+        row["other_cost"] = float(row["general_cost"] or 0) + float(row["travel_cost"] or 0)
+        row["total_consumed"] = float(row["shipped_amount"] or 0) + row["other_cost"]
+        row["budget_remaining"] = float(row["budget_amount"] or 0) - row["total_consumed"]
+        receivable = float(row["contract_amount"] or 0) or float(row["budget_amount"] or 0)
+        row["customer_debt"] = receivable - float(row["received_amount"] or 0)
+    return rows
+
+
+def active_project(conn: sqlite3.Connection, project_id: int) -> tuple[sqlite3.Row | None, str | None]:
+    project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    if not project:
+        return None, "项目不存在"
+    if project["status"] != "active":
+        return None, "项目已经结束，当前只能查询，不能继续增加或修改记录"
+    return project, None
+
+
+@app.get("/api/projects")
+@login_required
+def projects_list():
+    q = (request.args.get("q") or "").strip()
+    where = ""
+    params: list[str] = []
+    if q:
+        where = "WHERE p.project_no LIKE ? OR p.name LIKE ? OR c.name LIKE ?"
+        params = [f"%{q}%"] * 3
+    with db() as conn:
+        rows = project_summary_rows(conn, where, params)
+    return jsonify({"ok": True, "items": rows})
+
+
+@app.post("/api/projects")
+@login_required
+def project_create():
+    data = payload()
+    project_no = (data.get("project_no") or "").strip()
+    name = (data.get("name") or "").strip()
+    if not project_no or not name:
+        return jsonify({"ok": False, "message": "项目号和项目名称必须填写"}), 400
+    try:
+        attachments = save_uploads("attachments", "projects")
+        budget_amount = number_value(data, "budget_amount")
+        contract_amount = number_value(data, "contract_amount")
+        customer_id = int(data.get("customer_id") or 0)
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "message": f"项目金额、客户或附件格式不正确：{exc}"}), 400
+    user = current_user()
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone():
+            return jsonify({"ok": False, "message": "请选择客户"}), 400
+        if conn.execute("SELECT 1 FROM projects WHERE project_no=?", (project_no,)).fetchone():
+            return jsonify({"ok": False, "message": "项目号已存在，请更换项目号"}), 400
+        cursor = conn.execute(
+            """INSERT INTO projects
+            (project_no,name,customer_id,description,start_date,planned_end_date,budget_amount,contract_amount,
+             warranty_end_date,warranty_terms,status,remark,created_by,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?)""",
+            (project_no, name, customer_id, data.get("description") or "",
+             data.get("start_date") or datetime.now().strftime("%Y-%m-%d"), data.get("planned_end_date") or "",
+             budget_amount, contract_amount, data.get("warranty_end_date") or "", data.get("warranty_terms") or "",
+             data.get("remark") or "", user["display_name"], now_text(), now_text()),
+        )
+        for item in attachments:
+            conn.execute(
+                """INSERT INTO project_attachments
+                (project_id,file_name,file_path,file_type,uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?)""",
+                (cursor.lastrowid, item["file_name"], item["file_path"], item["file_type"], user["display_name"], now_text()),
+            )
+    log_action("新增项目", f"{project_no} {name}")
+    return jsonify({"ok": True, "project_id": cursor.lastrowid, "project_no": project_no})
+
+
+@app.get("/api/projects/<int:project_id>")
+@login_required
+def project_detail(project_id: int):
+    with db() as conn:
+        projects = project_summary_rows(conn, "WHERE p.id=?", (project_id,))
+        if not projects:
+            return jsonify({"ok": False, "message": "项目不存在"}), 404
+        expenses = rows_to_list(conn.execute(
+            "SELECT * FROM project_expenses WHERE project_id=? ORDER BY expense_date DESC,id DESC", (project_id,)
+        ))
+        travels = rows_to_list(conn.execute(
+            "SELECT * FROM project_travel_expenses WHERE project_id=? ORDER BY depart_date DESC,id DESC", (project_id,)
+        ))
+        payments = rows_to_list(conn.execute(
+            "SELECT * FROM project_payments WHERE project_id=? ORDER BY payment_date DESC,id DESC", (project_id,)
+        ))
+        events = rows_to_list(conn.execute(
+            "SELECT * FROM project_events WHERE project_id=? ORDER BY event_date DESC,id DESC", (project_id,)
+        ))
+        attachments = rows_to_list(conn.execute(
+            "SELECT * FROM project_attachments WHERE project_id=? ORDER BY id DESC", (project_id,)
+        ))
+        deliveries = rows_to_list(conn.execute(
+            """SELECT dn.id,dn.note_no,dn.delivery_date,dn.receiving_unit,dn.status,soh.order_no,
+                      COUNT(dni.id) AS item_count,COALESCE(SUM(dni.quantity),0) AS total_quantity,
+                      COALESCE(SUM(dni.quantity*soi.unit_price),0) AS amount
+               FROM delivery_notes dn JOIN sales_order_headers soh ON soh.id=dn.sales_order_id
+               JOIN delivery_note_items dni ON dni.delivery_note_id=dn.id
+               JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id
+               WHERE dn.project_id=? AND dn.status='confirmed'
+               GROUP BY dn.id ORDER BY dn.delivery_date DESC,dn.id DESC""", (project_id,)
+        ))
+        available_deliveries = rows_to_list(conn.execute(
+            """SELECT dn.id,dn.note_no,dn.delivery_date,soh.order_no,c.name AS customer_name,
+                      COALESCE(SUM(dni.quantity*soi.unit_price),0) AS amount
+               FROM delivery_notes dn JOIN sales_order_headers soh ON soh.id=dn.sales_order_id
+               JOIN customers c ON c.id=soh.customer_id
+               JOIN delivery_note_items dni ON dni.delivery_note_id=dn.id
+               JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id
+               WHERE dn.status='confirmed' AND dn.project_id IS NULL AND soh.customer_id=?
+               GROUP BY dn.id ORDER BY dn.delivery_date DESC,dn.id DESC""", (projects[0]["customer_id"],)
+        ))
+    return jsonify({"ok": True, "project": projects[0], "expenses": expenses, "travels": travels, "payments": payments,
+                    "events": events, "attachments": attachments, "deliveries": deliveries,
+                    "available_deliveries": available_deliveries})
+
+
+@app.put("/api/projects/<int:project_id>")
+@admin_required
+def project_update(project_id: int):
+    data = payload()
+    try:
+        customer_id = int(data.get("customer_id") or 0)
+        budget_amount = number_value(data, "budget_amount")
+        contract_amount = number_value(data, "contract_amount")
+        attachments = save_uploads("attachments", "projects")
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "message": f"项目资料格式不正确：{exc}"}), 400
+    user = current_user()
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        if not conn.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone():
+            return jsonify({"ok": False, "message": "请选择客户"}), 400
+        project_no = (data.get("project_no") or project["project_no"]).strip()
+        name = (data.get("name") or project["name"]).strip()
+        if conn.execute("SELECT 1 FROM projects WHERE project_no=? AND id<>?", (project_no, project_id)).fetchone():
+            return jsonify({"ok": False, "message": "项目号已存在"}), 400
+        linked_delivery = conn.execute("SELECT 1 FROM delivery_notes WHERE project_id=? LIMIT 1", (project_id,)).fetchone()
+        if linked_delivery and customer_id != project["customer_id"]:
+            return jsonify({"ok": False, "message": "项目已有发货记录，不能再更换客户"}), 400
+        conn.execute(
+            """UPDATE projects SET project_no=?,name=?,customer_id=?,description=?,start_date=?,planned_end_date=?,
+               budget_amount=?,contract_amount=?,warranty_end_date=?,warranty_terms=?,remark=?,updated_at=? WHERE id=?""",
+            (project_no, name, customer_id, data.get("description") or "", data.get("start_date") or project["start_date"],
+             data.get("planned_end_date") or "", budget_amount, contract_amount, data.get("warranty_end_date") or "",
+             data.get("warranty_terms") or "", data.get("remark") or "", now_text(), project_id),
+        )
+        for item in attachments:
+            conn.execute(
+                "INSERT INTO project_attachments (project_id,file_name,file_path,file_type,uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?)",
+                (project_id, item["file_name"], item["file_path"], item["file_type"], user["display_name"], now_text()),
+            )
+    log_action("修改项目", project_no)
+    return jsonify({"ok": True, "project_no": project_no})
+
+
+@app.post("/api/projects/<int:project_id>/expenses")
+@login_required
+def project_expense_create(project_id: int):
+    data = payload()
+    try:
+        quantity = number_value(data, "quantity", 1)
+        unit_price = number_value(data, "unit_price")
+        amount = number_value(data, "amount", quantity * unit_price)
+    except ValueError:
+        return jsonify({"ok": False, "message": "数量或金额格式不正确"}), 400
+    description = (data.get("description") or "").strip()
+    if not description or amount < 0:
+        return jsonify({"ok": False, "message": "费用说明必须填写，金额不能小于 0"}), 400
+    user = current_user()
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        conn.execute(
+            """INSERT INTO project_expenses
+            (project_id,expense_date,category,description,quantity,unit_price,amount,reference_no,remark,created_by,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (project_id, data.get("expense_date") or datetime.now().strftime("%Y-%m-%d"), data.get("category") or "其他",
+             description, quantity, unit_price, amount, data.get("reference_no") or "", data.get("remark") or "",
+             user["display_name"], now_text()),
+        )
+    log_action("新增项目费用", f"{project['project_no']} {description} {amount}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/projects/<int:project_id>/travels")
+@login_required
+def project_travel_create(project_id: int):
+    data = payload()
+    required = {
+        "traveler": "出差人员",
+        "destination": "出差地点",
+        "purpose": "出差事由",
+    }
+    for field, label in required.items():
+        if not (data.get(field) or "").strip():
+            return jsonify({"ok": False, "message": f"{label}必须填写"}), 400
+    depart_date = data.get("depart_date") or datetime.now().strftime("%Y-%m-%d")
+    return_date = data.get("return_date") or depart_date
+    if return_date < depart_date:
+        return jsonify({"ok": False, "message": "返回日期不能早于出发日期"}), 400
+    cost_fields = ("transport_cost", "accommodation_cost", "meal_cost", "allowance_cost", "other_cost")
+    try:
+        costs = {field: number_value(data, field) for field in cost_fields}
+    except ValueError:
+        return jsonify({"ok": False, "message": "差旅费用金额格式不正确"}), 400
+    if any(value < 0 for value in costs.values()):
+        return jsonify({"ok": False, "message": "差旅费用不能小于 0"}), 400
+    amount = sum(costs.values())
+    user = current_user()
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        conn.execute(
+            """INSERT INTO project_travel_expenses
+            (project_id,depart_date,return_date,traveler,destination,purpose,transport_cost,accommodation_cost,
+             meal_cost,allowance_cost,other_cost,amount,receipt_no,remark,created_by,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (project_id, depart_date, return_date, data["traveler"].strip(), data["destination"].strip(),
+             data["purpose"].strip(), costs["transport_cost"], costs["accommodation_cost"], costs["meal_cost"],
+             costs["allowance_cost"], costs["other_cost"], amount, data.get("receipt_no") or "",
+             data.get("remark") or "", user["display_name"], now_text()),
+        )
+    log_action("新增项目差旅费", f"{project['project_no']} {data['traveler']} {amount}")
+    return jsonify({"ok": True, "amount": amount})
+
+
+@app.post("/api/projects/<int:project_id>/payments")
+@login_required
+def project_payment_create(project_id: int):
+    data = payload()
+    try:
+        amount = number_value(data, "amount")
+    except ValueError:
+        return jsonify({"ok": False, "message": "收款金额格式不正确"}), 400
+    if amount <= 0:
+        return jsonify({"ok": False, "message": "收款金额必须大于 0"}), 400
+    user = current_user()
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        conn.execute(
+            """INSERT INTO project_payments
+            (project_id,payment_date,stage,amount,method,remark,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)""",
+            (project_id, data.get("payment_date") or datetime.now().strftime("%Y-%m-%d"), data.get("stage") or "",
+             amount, data.get("method") or "", data.get("remark") or "", user["display_name"], now_text()),
+        )
+    log_action("新增项目收款", f"{project['project_no']} {amount}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/projects/<int:project_id>/events")
+@login_required
+def project_event_create(project_id: int):
+    data = payload()
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"ok": False, "message": "事件标题必须填写"}), 400
+    user = current_user()
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        conn.execute(
+            """INSERT INTO project_events
+            (project_id,event_date,event_type,title,content,follow_up,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)""",
+            (project_id, data.get("event_date") or datetime.now().strftime("%Y-%m-%d"), data.get("event_type") or "项目进展",
+             title, data.get("content") or "", data.get("follow_up") or "", user["display_name"], now_text()),
+        )
+    log_action("新增项目事件", f"{project['project_no']} {title}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/projects/<int:project_id>/attachments")
+@login_required
+def project_attachment_upload(project_id: int):
+    try:
+        attachments = save_uploads("attachments", "projects")
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+    if not attachments:
+        return jsonify({"ok": False, "message": "请选择要上传的文件"}), 400
+    user = current_user()
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        for item in attachments:
+            conn.execute(
+                "INSERT INTO project_attachments (project_id,file_name,file_path,file_type,uploaded_by,uploaded_at) VALUES (?,?,?,?,?,?)",
+                (project_id, item["file_name"], item["file_path"], item["file_type"], user["display_name"], now_text()),
+            )
+    log_action("上传项目资料", f"{project['project_no']} {len(attachments)} 个文件")
+    return jsonify({"ok": True, "count": len(attachments)})
+
+
+@app.post("/api/projects/<int:project_id>/deliveries")
+@login_required
+def project_delivery_link(project_id: int):
+    data = payload()
+    try:
+        delivery_id = int(data.get("delivery_note_id") or 0)
+    except (TypeError, ValueError):
+        delivery_id = 0
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        delivery = conn.execute(
+            """SELECT dn.*,soh.customer_id FROM delivery_notes dn
+               JOIN sales_order_headers soh ON soh.id=dn.sales_order_id WHERE dn.id=?""", (delivery_id,)
+        ).fetchone()
+        if not delivery or delivery["status"] != "confirmed":
+            return jsonify({"ok": False, "message": "只能关联已经确认出库的发货单"}), 400
+        if delivery["project_id"]:
+            return jsonify({"ok": False, "message": "该发货单已经关联其他项目"}), 400
+        if delivery["customer_id"] != project["customer_id"]:
+            return jsonify({"ok": False, "message": "发货单客户与项目客户不一致"}), 400
+        conn.execute("UPDATE delivery_notes SET project_id=?,updated_at=? WHERE id=?", (project_id, now_text(), delivery_id))
+    log_action("关联项目发货单", f"{project['project_no']} {delivery['note_no']}")
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/projects/<int:project_id>/deliveries/<int:delivery_id>")
+@admin_required
+def project_delivery_unlink(project_id: int, delivery_id: int):
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        delivery = conn.execute(
+            "SELECT * FROM delivery_notes WHERE id=? AND project_id=? AND status='confirmed'",
+            (delivery_id, project_id),
+        ).fetchone()
+        if not delivery:
+            return jsonify({"ok": False, "message": "该项目中没有这张已确认发货单"}), 404
+        conn.execute("UPDATE delivery_notes SET project_id=NULL,updated_at=? WHERE id=?", (now_text(), delivery_id))
+    log_action("解除项目发货单", f"{project['project_no']} {delivery['note_no']}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/projects/<int:project_id>/complete")
+@admin_required
+def project_complete(project_id: int):
+    with db() as conn:
+        project, error = active_project(conn, project_id)
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        draft_delivery = conn.execute(
+            "SELECT note_no FROM delivery_notes WHERE project_id=? AND status='draft' LIMIT 1", (project_id,)
+        ).fetchone()
+        if draft_delivery:
+            return jsonify({"ok": False, "message": f"项目还有待确认发货单 {draft_delivery['note_no']}，请先确认或删除后再结束项目"}), 400
+        conn.execute("UPDATE projects SET status='completed',actual_end_date=?,updated_at=? WHERE id=?",
+                     (datetime.now().strftime("%Y-%m-%d"), now_text(), project_id))
+    log_action("结束项目", project["project_no"])
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/project-records/<record_type>/<int:record_id>")
+@admin_required
+def project_record_delete(record_type: str, record_id: int):
+    tables = {"expenses": "project_expenses", "travels": "project_travel_expenses",
+              "payments": "project_payments", "events": "project_events"}
+    table = tables.get(record_type)
+    if not table:
+        return jsonify({"ok": False, "message": "记录类型不正确"}), 400
+    with db() as conn:
+        record = conn.execute(f"SELECT project_id FROM {table} WHERE id=?", (record_id,)).fetchone()
+        if not record:
+            return jsonify({"ok": False, "message": "记录不存在"}), 404
+        project, error = active_project(conn, record["project_id"])
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        conn.execute(f"DELETE FROM {table} WHERE id=?", (record_id,))
+    log_action("删除项目记录", f"{project['project_no']} {record_type} ID {record_id}")
+    return jsonify({"ok": True})
+
+
+@app.get("/api/project-attachments/<int:attachment_id>/<action>")
+@login_required
+def project_attachment_file(attachment_id: int, action: str):
+    if action not in ("view", "download"):
+        return jsonify({"ok": False, "message": "操作不支持"}), 404
+    with db() as conn:
+        item = conn.execute("SELECT * FROM project_attachments WHERE id=?", (attachment_id,)).fetchone()
+    if not item:
+        return jsonify({"ok": False, "message": "附件不存在"}), 404
+    target = (WRITE_DIR / item["file_path"]).resolve()
+    if WRITE_DIR.resolve() not in target.parents or not target.exists():
+        return jsonify({"ok": False, "message": "附件文件不存在"}), 404
+    return send_file(target, as_attachment=action == "download", download_name=item["file_name"])
+
+
+@app.delete("/api/project-attachments/<int:attachment_id>")
+@admin_required
+def project_attachment_delete(attachment_id: int):
+    with db() as conn:
+        item = conn.execute("SELECT * FROM project_attachments WHERE id=?", (attachment_id,)).fetchone()
+        if not item:
+            return jsonify({"ok": False, "message": "附件不存在"}), 404
+        project, error = active_project(conn, item["project_id"])
+        if error:
+            return jsonify({"ok": False, "message": error}), 400
+        conn.execute("DELETE FROM project_attachments WHERE id=?", (attachment_id,))
+    delete_uploaded_file(item["file_path"])
+    log_action("删除项目资料", f"{project['project_no']} {item['file_name']}")
+    return jsonify({"ok": True})
+
+
 def delivery_note_items(conn: sqlite3.Connection, note_id: int) -> list[dict]:
     return rows_to_list(conn.execute(
         """
         SELECT dni.*,p.code AS product_code,p.name AS product_name,p.description,p.unit,
-               soi.quantity AS ordered_quantity,soi.shipped_quantity
+               soi.quantity AS ordered_quantity,soi.shipped_quantity,soi.unit_price,
+               dni.quantity*soi.unit_price AS amount
         FROM delivery_note_items dni
         JOIN products p ON p.id=dni.product_id
         JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id
@@ -2026,28 +2595,33 @@ def delivery_notes_list():
     with db() as conn:
         rows = rows_to_list(conn.execute(
             f"""
-            SELECT dn.*,soh.order_no,c.name AS customer_name,COUNT(dni.id) AS item_count,
-                   COALESCE(SUM(dni.quantity),0) AS total_quantity
+            SELECT dn.*,soh.order_no,c.name AS customer_name,p.project_no,p.name AS project_name,
+                   COUNT(dni.id) AS item_count,COALESCE(SUM(dni.quantity),0) AS total_quantity,
+                   COALESCE(SUM(dni.quantity*soi.unit_price),0) AS amount
             FROM delivery_notes dn JOIN sales_order_headers soh ON soh.id=dn.sales_order_id
             JOIN customers c ON c.id=soh.customer_id
             LEFT JOIN delivery_note_items dni ON dni.delivery_note_id=dn.id
+            LEFT JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id
+            LEFT JOIN projects p ON p.id=dn.project_id
             {where} GROUP BY dn.id ORDER BY dn.id DESC
             """, params
         ))
         for row in rows:
             row["items"] = delivery_note_items(conn, row["id"])
         defaults = conn.execute(
-            """SELECT shipping_unit,sender_address FROM delivery_notes
+            """SELECT shipping_unit,sender_address,sender_contact,sender_phone FROM delivery_notes
                WHERE shipping_unit!='' ORDER BY id DESC LIMIT 1"""
         ).fetchone()
         if not defaults:
             defaults = conn.execute(
-                """SELECT shipping_unit,sender_address FROM quotations
+                """SELECT shipping_unit,sender_address,sender_contact,sender_phone FROM quotations
                    WHERE shipping_unit!='' ORDER BY id DESC LIMIT 1"""
             ).fetchone()
     return jsonify({"ok": True, "items": rows,
                     "default_shipping_unit": defaults["shipping_unit"] if defaults else "",
-                    "default_sender_address": defaults["sender_address"] if defaults and defaults["sender_address"] else ""})
+                    "default_sender_address": defaults["sender_address"] if defaults and defaults["sender_address"] else "",
+                    "default_sender_contact": defaults["sender_contact"] if defaults and defaults["sender_contact"] else "",
+                    "default_sender_phone": defaults["sender_phone"] if defaults and defaults["sender_phone"] else ""})
 
 
 def validate_delivery_items(conn: sqlite3.Connection, order_id: int, raw_items: list) -> tuple[list[tuple], str | None]:
@@ -2105,18 +2679,26 @@ def delivery_note_create():
         receiving_unit = (data.get("receiving_unit") or order["customer_name"] or "").strip()
         if not shipping_unit or not receiving_unit:
             return jsonify({"ok": False, "message": "发货单位和收货单位必须填写"}), 400
+        project_id = data.get("project_id") or None
+        if project_id:
+            project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            if not project or project["status"] != "active":
+                return jsonify({"ok": False, "message": "请选择进行中的项目"}), 400
+            if project["customer_id"] != order["customer_id"]:
+                return jsonify({"ok": False, "message": "项目客户与销售订单客户不一致"}), 400
         note_no = (data.get("note_no") or "").strip() or next_order_no(conn, "delivery_notes", "DN", "note_no")
         if conn.execute("SELECT 1 FROM delivery_notes WHERE note_no=?", (note_no,)).fetchone():
             return jsonify({"ok": False, "message": "发货单号已存在"}), 400
         cursor = conn.execute(
             """INSERT INTO delivery_notes
-            (note_no,sales_order_id,delivery_date,shipping_unit,sender_address,receiving_unit,receiver_contact,
-             receiver_phone,receiver_address,delivery_method,status,remark,created_by,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?)""",
+            (note_no,sales_order_id,delivery_date,shipping_unit,sender_address,sender_contact,sender_phone,receiving_unit,receiver_contact,
+             receiver_phone,receiver_address,delivery_method,status,remark,created_by,created_at,updated_at,project_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'draft',?,?,?,?,?)""",
             (note_no, order_id, data.get("delivery_date") or datetime.now().strftime("%Y-%m-%d"), shipping_unit,
-             data.get("sender_address") or "", receiving_unit, data.get("receiver_contact") or order["contact"] or "",
+             data.get("sender_address") or "", data.get("sender_contact") or "", data.get("sender_phone") or "",
+             receiving_unit, data.get("receiver_contact") or order["contact"] or "",
              data.get("receiver_phone") or order["phone"] or "", data.get("receiver_address") or order["address"] or "",
-             data.get("delivery_method") or "", data.get("remark") or "", user["display_name"], now_text(), now_text()),
+             data.get("delivery_method") or "", data.get("remark") or "", user["display_name"], now_text(), now_text(), project_id),
         )
         for item, quantity, remark in items:
             conn.execute(
@@ -2138,6 +2720,10 @@ def delivery_note_confirm(note_id: int):
             return jsonify({"ok": False, "message": "发货单不存在"}), 404
         if note["status"] != "draft":
             return jsonify({"ok": False, "message": "该发货单已经确认，不能重复扣减库存"}), 400
+        if note["project_id"]:
+            project = conn.execute("SELECT status FROM projects WHERE id=?", (note["project_id"],)).fetchone()
+            if not project or project["status"] != "active":
+                return jsonify({"ok": False, "message": "关联项目已经结束，不能再确认这张发货单"}), 400
         items = conn.execute(
             """SELECT dni.*,soi.quantity ordered_quantity,soi.shipped_quantity,p.code,p.current_stock
                FROM delivery_note_items dni JOIN sales_order_items soi ON soi.id=dni.sales_order_item_id

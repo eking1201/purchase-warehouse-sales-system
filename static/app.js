@@ -3,8 +3,9 @@ const state = {
   suppliers: [],
   customers: [],
   products: [],
-  quotationDefaults: { companyName: '', senderAddress: '' },
-  deliveryDefaults: { shippingUnit: '', senderAddress: '' },
+  projects: [],
+  quotationDefaults: { companyName: '', senderAddress: '', senderContact: '', senderPhone: '' },
+  deliveryDefaults: { shippingUnit: '', senderAddress: '', senderContact: '', senderPhone: '' },
   template: {
     levels: ['A', 'B', 'C'],
     company_types: ['外企', '私企', '个人'],
@@ -23,6 +24,7 @@ const titles = {
   products: ['产品管理', '维护备件资料、安全库存、价格和附件'],
   purchases: ['采购管理', '按整张采购单管理多项备件、分批到货和逾期提醒'],
   sales: ['销售管理', '按整张销售单管理多项备件和分批发货'],
+  projects: ['项目管理', '跟踪长期维修或工程项目的发货、费用、收款、质保和资料'],
   stock: ['库存管理', '查看实时库存、预警和库存流水'],
   stats: ['统计分析', '按时间范围查看采购、销售、利润和排行'],
   users: ['用户管理', '管理员维护登录账号和角色'],
@@ -117,6 +119,14 @@ const forms = {
     ['product_id', '产品', 'product', true], ['movement_type', '类型', 'select:手工入库,手工出库'],
     ['quantity', '数量', 'number', true], ['remark', '备注', 'textarea']
   ],
+  projects: [
+    ['project_no', '项目号', 'text', true], ['name', '项目名称', 'text', true],
+    ['customer_id', '客户', 'customer', true], ['start_date', '开始日期', 'date', true],
+    ['planned_end_date', '计划结束日期', 'date'], ['budget_amount', '项目预算金额', 'number'],
+    ['contract_amount', '合同/应收金额', 'number'], ['warranty_end_date', '质保到期日', 'date'],
+    ['description', '本次项目描述', 'textarea'], ['warranty_terms', '质保说明', 'textarea'],
+    ['attachments', '项目资料（可多选）', 'files'], ['remark', '备注', 'textarea']
+  ],
   users: [
     ['username', '用户名', 'text', true], ['password', '密码', 'password', true],
     ['display_name', '显示名称'], ['role', '角色', 'select:user,admin']
@@ -147,6 +157,12 @@ function money(value) {
   return Number(value || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  })[char]);
+}
+
 function tableHtml(cols, rows, options = {}) {
   const actionHead = options.actions ? '<th>操作</th>' : '';
   const body = rows.map(row => {
@@ -164,7 +180,7 @@ function tableHtml(cols, rows, options = {}) {
 function mountToolbar(view) {
   const tpl = $('#toolbarTemplate').content.cloneNode(true);
   const toolbar = tpl.querySelector('.toolbar');
-  if (!['suppliers', 'customers', 'products', 'purchases', 'sales'].includes(view)) {
+  if (!['suppliers', 'customers', 'products', 'purchases', 'sales', 'projects'].includes(view)) {
     toolbar.querySelector('.search').remove();
     toolbar.querySelector('.searchBtn').remove();
   }
@@ -187,15 +203,17 @@ function setView(view) {
 }
 
 async function refreshLookups() {
-  const [suppliers, customers, products, template] = await Promise.all([
+  const [suppliers, customers, products, projects, template] = await Promise.all([
     api('/api/suppliers'),
     api('/api/customers'),
     api('/api/products'),
+    api('/api/projects'),
     api('/api/template-info'),
   ]);
   state.suppliers = suppliers.items;
   state.customers = customers.items;
   state.products = products.items;
+  state.projects = projects.items;
   state.template = { ...state.template, ...template };
 }
 
@@ -214,6 +232,8 @@ async function renderDashboard() {
       ${card('库存不足产品', c.low_stock, c.low_stock > 0)}
       ${card('采购逾期未到货', c.overdue_purchases, c.overdue_purchases > 0)}
       ${card('销售逾期未发货', c.overdue_sales, c.overdue_sales > 0)}
+      ${card('进行中项目', c.active_projects)}
+      ${card('延期未结束项目', c.overdue_projects, c.overdue_projects > 0)}
     </div>
     <div class="panel">
       <h2>库存预警</h2>
@@ -256,6 +276,278 @@ async function renderCrud(view) {
     content.appendChild(importPanel);
     importPanel.querySelector('#importBtn').onclick = () => importData(view);
   }
+}
+
+function projectStatusText(status) {
+  return ({ active: '进行中', completed: '已结束', cancelled: '已取消' })[status] || status;
+}
+
+async function renderProjects() {
+  await refreshLookups();
+  const data = await api('/api/projects');
+  const content = $('#content');
+  const activeCount = data.items.filter(item => item.status === 'active').length;
+  const totalBudget = data.items.reduce((sum, item) => sum + Number(item.budget_amount || 0), 0);
+  const totalShipped = data.items.reduce((sum, item) => sum + Number(item.shipped_amount || 0), 0);
+  const totalTravel = data.items.reduce((sum, item) => sum + Number(item.travel_cost || 0), 0);
+  const totalConsumed = data.items.reduce((sum, item) => sum + Number(item.total_consumed || 0), 0);
+  const totalDebt = data.items.reduce((sum, item) => sum + Number(item.customer_debt || 0), 0);
+  content.innerHTML = `
+    <div class="cards project-cards">
+      ${card('进行中项目', activeCount)}
+      ${card('项目预算合计', money(totalBudget))}
+      ${card('发货单总计价格', money(totalShipped))}
+      ${card('差旅费合计', money(totalTravel))}
+      ${card('累计项目消耗', money(totalConsumed))}
+      ${card('客户欠款合计', money(totalDebt), totalDebt > 0)}
+    </div>`;
+  const toolbar = mountToolbar('projects');
+  toolbar.querySelector('.newBtn').textContent = '新增项目';
+  toolbar.querySelector('.newBtn').onclick = () => openForm('projects');
+  toolbar.querySelector('.exportBtn').remove();
+  toolbar.querySelector('.searchBtn').onclick = async () => {
+    const result = await api(`/api/projects?q=${encodeURIComponent(toolbar.querySelector('.search').value)}`);
+    renderProjectTable(result.items);
+  };
+  content.appendChild(toolbar);
+  content.insertAdjacentHTML('beforeend', '<div id="projectTableHolder"></div>');
+  renderProjectTable(data.items);
+}
+
+function renderProjectTable(rows) {
+  const displayRows = rows.map(row => ({
+    ...row,
+    status_text: projectStatusText(row.status),
+    budget_text: money(row.budget_amount),
+    shipped_text: money(row.shipped_amount),
+    travel_text: money(row.travel_cost),
+    consumed_text: money(row.total_consumed),
+    received_text: money(row.received_amount),
+    debt_text: money(row.customer_debt),
+  }));
+  const cols = [
+    ['project_no','项目号'],['name','项目名称'],['customer_name','客户'],['status_text','状态'],
+    ['start_date','开始日期'],['planned_end_date','计划结束'],['budget_text','预算金额'],
+    ['delivery_count','发货单数量'],['shipped_text','发货总计价格'],['travel_text','差旅费'],
+    ['consumed_text','累计消耗'],['received_text','累计收款'],['debt_text','客户欠款']
+  ];
+  $('#projectTableHolder').innerHTML = tableHtml(cols, displayRows, { actions: row => `
+    <button class="primary" onclick="openProjectDetail(${row.id})">打开项目</button>
+    ${row.status === 'active' && canEditBase() ? `<button onclick="openForm('projects', state.projects.find(item => Number(item.id) === ${row.id}))">修改</button>` : ''}
+    ${row.status === 'active' && canEditBase() ? `<button onclick="completeProject(${row.id})">结束项目</button>` : ''}` });
+}
+
+async function openProjectDetail(projectId) {
+  try {
+    const data = await api(`/api/projects/${projectId}`);
+    const p = data.project;
+    const editable = p.status === 'active';
+    $('#pageTitle').textContent = `${p.project_no} ${p.name}`;
+    $('#pageSubTitle').textContent = `${p.customer_name} · ${projectStatusText(p.status)}`;
+    $('#content').innerHTML = `
+      <div class="toolbar project-detail-toolbar">
+        <button id="backProjectsBtn">返回项目列表</button>
+        ${editable ? '<button id="addExpenseBtn" class="primary">增加费用</button><button id="addTravelBtn" class="primary">增加差旅费</button><button id="addPaymentBtn" class="primary">登记收款</button><button id="addEventBtn">记录投诉/会议</button><button id="uploadProjectFileBtn">上传资料</button>' : ''}
+        ${editable && canEditBase() ? '<button id="editProjectBtn">修改项目</button><button id="completeProjectBtn">结束项目</button>' : ''}
+        <button id="printProjectBtn">打印项目汇总</button>
+      </div>
+      <div class="cards project-cards">
+        ${card('项目预算', money(p.budget_amount))}
+        ${card('合同/应收金额', money(p.contract_amount || p.budget_amount))}
+        ${card('已出货金额', money(p.shipped_amount))}
+        ${card('差旅费', money(p.travel_cost))}
+        ${card('其他费用', money(p.general_cost))}
+        ${card('累计消耗', money(p.total_consumed), p.total_consumed > p.budget_amount && p.budget_amount > 0)}
+        ${card('预算剩余', money(p.budget_remaining), p.budget_remaining < 0)}
+        ${card('累计收款', money(p.received_amount))}
+        ${card('客户欠款', money(p.customer_debt), p.customer_debt > 0)}
+      </div>
+      <section class="project-info-band">
+        <div><strong>客户</strong><span>${escapeHtml(p.customer_name)}</span></div>
+        <div><strong>项目周期</strong><span>${escapeHtml(p.start_date)} 至 ${escapeHtml(p.actual_end_date || p.planned_end_date || '未填写')}</span></div>
+        <div><strong>质保到期</strong><span>${escapeHtml(p.warranty_end_date || '未填写')}</span></div>
+        <div class="wide"><strong>项目描述</strong><span>${escapeHtml(p.description || '未填写')}</span></div>
+        <div class="wide"><strong>质保说明</strong><span>${escapeHtml(p.warranty_terms || '未填写')}</span></div>
+      </section>
+      <section class="project-section">
+        <div class="section-head"><div><h2>仓库发货记录</h2><p>只统计已经确认出库的发货单，金额按销售单价计算。</p></div>
+          ${editable && data.available_deliveries.length ? '<button id="linkDeliveryBtn" class="primary">关联已有发货单</button>' : ''}
+        </div>
+        <div class="project-inline-summary">
+          <span><strong>${data.deliveries.length}</strong> 张发货单</span>
+          <span><strong>${data.deliveries.reduce((sum, item) => sum + Number(item.item_count || 0), 0)}</strong> 个发货项</span>
+          <span><strong>${data.deliveries.reduce((sum, item) => sum + Number(item.total_quantity || 0), 0)}</strong> 发货总数量</span>
+          <span><strong>￥${money(p.shipped_amount)}</strong> 发货单总计价格</span>
+        </div>
+        ${projectDeliveryTable(data.deliveries, editable, projectId)}
+      </section>
+      <section class="project-section"><div class="section-head"><div><h2>差旅费记录</h2><p>记录人员、地点、时间，以及交通、住宿、餐费和补助明细。</p></div></div>
+        <div id="projectTravelTable">${projectRecordTable('travels', data.travels, editable)}</div></section>
+      <section class="project-section"><div class="section-head"><div><h2>人工及其他费用</h2><p>记录人工、外协、材料、运输等非仓库费用。</p></div></div>
+        <div id="projectExpenseTable">${projectRecordTable('expenses', data.expenses, editable)}</div></section>
+      <section class="project-section"><div class="section-head"><div><h2>客户进度收款</h2><p>客户欠款 = 合同/应收金额 - 累计收款。</p></div></div>
+        <div id="projectPaymentTable">${projectRecordTable('payments', data.payments, editable)}</div></section>
+      <section class="project-section"><div class="section-head"><div><h2>项目事件</h2><p>集中记录项目进展、客户投诉、会议和质量问题。</p></div></div>
+        <div id="projectEventTable">${projectRecordTable('events', data.events, editable)}</div></section>
+      <section class="project-section"><div class="section-head"><div><h2>项目资料</h2><p>支持图片、PDF、Word 和 Excel 文件。</p></div></div>
+        ${projectAttachmentTable(data.attachments, editable)}
+      </section>`;
+    $('#backProjectsBtn').onclick = () => { $('#pageTitle').textContent = titles.projects[0]; $('#pageSubTitle').textContent = titles.projects[1]; loadView(); };
+    if (editable) {
+      $('#addExpenseBtn').onclick = () => openProjectRecordForm(projectId, 'expenses');
+      $('#addTravelBtn').onclick = () => openProjectRecordForm(projectId, 'travels');
+      $('#addPaymentBtn').onclick = () => openProjectRecordForm(projectId, 'payments');
+      $('#addEventBtn').onclick = () => openProjectRecordForm(projectId, 'events');
+      $('#uploadProjectFileBtn').onclick = () => openProjectUploadForm(projectId);
+      if ($('#linkDeliveryBtn')) $('#linkDeliveryBtn').onclick = () => openProjectDeliveryLink(projectId, data.available_deliveries);
+    }
+    if ($('#editProjectBtn')) $('#editProjectBtn').onclick = () => openForm('projects', p);
+    if ($('#completeProjectBtn')) $('#completeProjectBtn').onclick = () => completeProject(projectId);
+    $('#printProjectBtn').onclick = () => printProjectSummary(data);
+  } catch (error) { showMessage(error.message); }
+}
+
+function projectRecordTable(type, rows, editable) {
+  const configs = {
+    expenses: [['expense_date','日期'],['category','类别'],['description','费用说明'],['quantity','数量'],['unit_price_text','单价'],['amount_text','金额'],['reference_no','凭证/单号'],['created_by','记录人']],
+    travels: [['depart_date','出发日期'],['return_date','返回日期'],['traveler','出差人员'],['destination','地点'],['purpose','事由'],['transport_text','交通'],['accommodation_text','住宿'],['meal_text','餐费'],['allowance_text','补助'],['other_text','其他'],['amount_text','合计'],['created_by','记录人']],
+    payments: [['payment_date','收款日期'],['stage','付款阶段'],['amount_text','收款金额'],['method','收款方式'],['remark','备注'],['created_by','记录人']],
+    events: [['event_date','日期'],['event_type','类型'],['title','标题'],['content','内容'],['follow_up','处理/跟进'],['created_by','记录人']],
+  };
+  const formatted = rows.map(row => ({...row, unit_price_text: money(row.unit_price), amount_text: money(row.amount),
+    transport_text: money(row.transport_cost), accommodation_text: money(row.accommodation_cost),
+    meal_text: money(row.meal_cost), allowance_text: money(row.allowance_cost), other_text: money(row.other_cost)}));
+  return tableHtml(configs[type], formatted, { actions: editable && canEditBase() ? row => `<button class="danger" onclick="deleteProjectRecord('${type}', ${row.id}, ${row.project_id})">删除</button>` : null });
+}
+
+function projectDeliveryTable(rows, editable, projectId) {
+  const formatted = rows.map(item => ({...item, amount_text: money(item.amount)}));
+  const cols = [['delivery_date','发货日期'],['note_no','发货单号'],['order_no','销售单号'],['item_count','项数'],['total_quantity','数量'],['amount_text','发货金额']];
+  return tableHtml(cols, formatted, { actions: row => `<button onclick="openExistingDeliveryNote(${row.id})">查看明细</button>${editable && canEditBase() ? `<button onclick="unlinkProjectDelivery(${projectId}, ${row.id})">解除关联</button>` : ''}` });
+}
+
+function projectAttachmentTable(rows, editable) {
+  const body = rows.map(item => {
+    const type = String(item.file_type || '').toLowerCase();
+    const previewable = ['jpg','jpeg','png','pdf'].includes(type);
+    const encodedName = encodeURIComponent(item.file_name || '项目附件');
+    return `<tr><td>${escapeHtml(item.file_name)}</td><td>${escapeHtml(type.toUpperCase())}</td><td>${escapeHtml(item.uploaded_by)}</td><td>${escapeHtml(item.uploaded_at)}</td><td><div class="actions">
+      ${previewable ? `<button onclick="openProjectAttachmentPreview(${item.id}, '${encodedName}', '${type}')">预览</button>` : ''}
+      <button onclick="location.href='/api/project-attachments/${item.id}/download'">下载</button>
+      ${editable && canEditBase() ? `<button class="danger" onclick="deleteProjectAttachment(${item.id}, ${item.project_id})">删除</button>` : ''}
+    </div></td></tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table><thead><tr><th>文件名</th><th>类型</th><th>上传人</th><th>上传时间</th><th>操作</th></tr></thead><tbody>${body || '<tr><td colspan="5">暂无项目资料</td></tr>'}</tbody></table></div>`;
+}
+
+function openProjectAttachmentPreview(id, encodedName, type) {
+  openAttachmentPreview(id, decodeURIComponent(encodedName), type, '/api/project-attachments');
+}
+
+function openProjectRecordForm(projectId, type) {
+  const today = new Date().toISOString().slice(0, 10);
+  const configs = {
+    expenses: {
+      title: '增加项目费用',
+      html: `<label>费用日期<input name="expense_date" type="date" value="${today}" required></label><label>费用类别<select name="category"><option>人工</option><option>差旅</option><option>外协</option><option>材料</option><option>运输</option><option>其他</option></select></label><label class="wide">费用说明<input name="description" required placeholder="例如：现场维修人工 2 天"></label><label>数量<input name="quantity" type="number" step="any" min="0" value="1" required></label><label>单价<input name="unit_price" type="number" step="0.01" min="0" value="0" required></label><label>金额<input name="amount" type="number" step="0.01" min="0" placeholder="留空时按数量×单价"></label><label>凭证/关联单号<input name="reference_no"></label><label class="wide">备注<textarea name="remark"></textarea></label>`
+    },
+    travels: {
+      title: '增加项目差旅费',
+      html: `<label>出发日期<input name="depart_date" type="date" value="${today}" required></label><label>返回日期<input name="return_date" type="date" value="${today}" required></label><label>出差人员<input name="traveler" required placeholder="例如：张三、李四"></label><label>出差地点<input name="destination" required placeholder="例如：无锡客户现场"></label><label class="wide">出差事由<input name="purpose" required placeholder="例如：设备拆检和故障确认"></label><label>交通费<input class="travel-cost" name="transport_cost" type="number" step="0.01" min="0" value="0"></label><label>住宿费<input class="travel-cost" name="accommodation_cost" type="number" step="0.01" min="0" value="0"></label><label>餐费<input class="travel-cost" name="meal_cost" type="number" step="0.01" min="0" value="0"></label><label>出差补助<input class="travel-cost" name="allowance_cost" type="number" step="0.01" min="0" value="0"></label><label>其他费用<input class="travel-cost" name="other_cost" type="number" step="0.01" min="0" value="0"></label><label>差旅合计<input id="travelTotal" value="0.00" readonly></label><label>票据/报销单号<input name="receipt_no"></label><label class="wide">备注<textarea name="remark"></textarea></label>`
+    },
+    payments: {
+      title: '登记客户收款',
+      html: `<label>收款日期<input name="payment_date" type="date" value="${today}" required></label><label>付款阶段<input name="stage" placeholder="例如：首付款、进度款、验收款"></label><label>收款金额<input name="amount" type="number" step="0.01" min="0.01" required></label><label>收款方式<select name="method"><option>银行转账</option><option>现金</option><option>承兑</option><option>其他</option></select></label><label class="wide">备注<textarea name="remark"></textarea></label>`
+    },
+    events: {
+      title: '记录项目事件',
+      html: `<label>日期<input name="event_date" type="date" value="${today}" required></label><label>类型<select name="event_type"><option>项目进展</option><option>客户投诉</option><option>项目会议</option><option>质量问题</option><option>验收记录</option><option>其他</option></select></label><label class="wide">标题<input name="title" required></label><label class="wide">详细内容<textarea name="content"></textarea></label><label class="wide">处理结果/下一步<textarea name="follow_up"></textarea></label>`
+    }
+  };
+  const config = configs[type];
+  $('#modalTitle').textContent = config.title;
+  const form = $('#modalForm');
+  form.innerHTML = config.html + '<div class="form-actions"><button type="button" id="cancelBtn">取消</button><button class="primary" type="submit">保存</button></div>';
+  $('#modal').classList.remove('hidden'); $('#cancelBtn').onclick = closeModal;
+  if (type === 'travels') {
+    const updateTravelTotal = () => {
+      $('#travelTotal').value = money(Array.from(form.querySelectorAll('.travel-cost')).reduce((sum, input) => sum + Number(input.value || 0), 0));
+    };
+    form.querySelectorAll('.travel-cost').forEach(input => input.addEventListener('input', updateTravelTotal));
+    updateTravelTotal();
+  }
+  form.onsubmit = async event => {
+    event.preventDefault();
+    try {
+      await api(`/api/projects/${projectId}/${type}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(Object.fromEntries(new FormData(form))) });
+      closeModal(); showMessage('项目记录已保存', true); await openProjectDetail(projectId);
+    } catch (error) { showMessage(error.message); }
+  };
+}
+
+function openProjectDeliveryLink(projectId, deliveries) {
+  $('#modalTitle').textContent = '关联已确认发货单';
+  const form = $('#modalForm');
+  form.innerHTML = `<label class="wide">选择发货单<select name="delivery_note_id" required><option value="">请选择</option>${deliveries.map(item => `<option value="${item.id}">${escapeHtml(item.delivery_date)} · ${escapeHtml(item.note_no)} · ${escapeHtml(item.order_no)} · ￥${money(item.amount)}</option>`).join('')}</select></label><div class="form-actions"><button type="button" id="cancelBtn">取消</button><button class="primary" type="submit">确认关联</button></div>`;
+  $('#modal').classList.remove('hidden'); $('#cancelBtn').onclick = closeModal;
+  form.onsubmit = async event => {
+    event.preventDefault();
+    try {
+      await api(`/api/projects/${projectId}/deliveries`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(form)))});
+      closeModal(); showMessage('发货单已计入项目', true); await openProjectDetail(projectId);
+    } catch (error) { showMessage(error.message); }
+  };
+}
+
+function openProjectUploadForm(projectId) {
+  $('#modalTitle').textContent = '上传项目资料';
+  const form = $('#modalForm');
+  form.innerHTML = '<label class="wide">选择文件<input name="attachments" type="file" multiple required></label><div class="form-actions"><button type="button" id="cancelBtn">取消</button><button class="primary" type="submit">上传</button></div>';
+  $('#modal').classList.remove('hidden'); $('#cancelBtn').onclick = closeModal;
+  form.onsubmit = async event => {
+    event.preventDefault();
+    try {
+      const result = await api(`/api/projects/${projectId}/attachments`, {method:'POST',body:new FormData(form)});
+      closeModal(); showMessage(`上传成功：${result.count} 个文件`, true); await openProjectDetail(projectId);
+    } catch (error) { showMessage(error.message); }
+  };
+}
+
+async function deleteProjectRecord(type, id, projectId) {
+  if (!confirm('确认删除这条项目记录吗？')) return;
+  try { await api(`/api/project-records/${type}/${id}`, {method:'DELETE'}); showMessage('记录已删除', true); await openProjectDetail(projectId); }
+  catch (error) { showMessage(error.message); }
+}
+
+async function deleteProjectAttachment(id, projectId) {
+  if (!confirm('确认删除这个项目附件吗？')) return;
+  try { await api(`/api/project-attachments/${id}`, {method:'DELETE'}); showMessage('附件已删除', true); await openProjectDetail(projectId); }
+  catch (error) { showMessage(error.message); }
+}
+
+async function unlinkProjectDelivery(projectId, deliveryId) {
+  if (!confirm('确认解除这张发货单与项目的关联吗？库存不会改变，只会从项目统计中移除。')) return;
+  try { await api(`/api/projects/${projectId}/deliveries/${deliveryId}`, {method:'DELETE'}); showMessage('发货单已从项目统计中移除', true); await openProjectDetail(projectId); }
+  catch (error) { showMessage(error.message); }
+}
+
+async function completeProject(projectId) {
+  if (!confirm('确认结束这个项目吗？结束后项目资料和明细将锁定，只能查询。')) return;
+  try {
+    await api(`/api/projects/${projectId}/complete`, {method:'POST'});
+    $('#pageTitle').textContent = titles.projects[0]; $('#pageSubTitle').textContent = titles.projects[1];
+    showMessage('项目已结束并锁定', true); await loadView();
+  }
+  catch (error) { showMessage(error.message); }
+}
+
+function printProjectSummary(data) {
+  const p = data.project;
+  const rows = data.deliveries.map(item => `<tr><td>${escapeHtml(item.delivery_date)}</td><td>${escapeHtml(item.note_no)}</td><td>${item.item_count}</td><td>${item.total_quantity}</td><td>${money(item.amount)}</td></tr>`).join('');
+  const expenseRows = data.expenses.map(item => `<tr><td>${escapeHtml(item.expense_date)}</td><td>${escapeHtml(item.category)}</td><td>${escapeHtml(item.description)}</td><td>${money(item.amount)}</td></tr>`).join('');
+  const travelRows = data.travels.map(item => `<tr><td>${escapeHtml(item.depart_date)} 至 ${escapeHtml(item.return_date)}</td><td>${escapeHtml(item.traveler)}</td><td>${escapeHtml(item.destination)}</td><td>${escapeHtml(item.purpose)}</td><td>${money(item.amount)}</td></tr>`).join('');
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(p.project_no)} 项目汇总</title><style>@page{size:A4;margin:15mm}body{font-family:Arial,"Microsoft YaHei";color:#111}h1{text-align:center}table{width:100%;border-collapse:collapse;margin:8px 0 20px}th,td{border:1px solid #666;padding:7px;text-align:left}.summary{display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;border:1px solid #666;padding:12px}</style></head><body><h1>项目汇总</h1><div class="summary"><span>项目号：${escapeHtml(p.project_no)}</span><span>项目名称：${escapeHtml(p.name)}</span><span>客户：${escapeHtml(p.customer_name)}</span><span>状态：${projectStatusText(p.status)}</span><span>预算：￥${money(p.budget_amount)}</span><span>合同/应收：￥${money(p.contract_amount || p.budget_amount)}</span><span>发货单总计：￥${money(p.shipped_amount)}</span><span>差旅费：￥${money(p.travel_cost)}</span><span>累计消耗：￥${money(p.total_consumed)}</span><span>客户欠款：￥${money(p.customer_debt)}</span></div><h2>项目描述</h2><p>${escapeHtml(p.description || '-')}</p><h2>仓库发货记录（总计 ￥${money(p.shipped_amount)}）</h2><table><tr><th>日期</th><th>发货单号</th><th>项数</th><th>数量</th><th>金额</th></tr>${rows || '<tr><td colspan="5">暂无</td></tr>'}</table><h2>差旅费</h2><table><tr><th>日期</th><th>人员</th><th>地点</th><th>事由</th><th>合计</th></tr>${travelRows || '<tr><td colspan="5">暂无</td></tr>'}</table><h2>人工及其他费用</h2><table><tr><th>日期</th><th>类别</th><th>说明</th><th>金额</th></tr>${expenseRows || '<tr><td colspan="4">暂无</td></tr>'}</table><script>window.print()</script></body></html>`;
+  const win = window.open('', '_blank'); win.document.write(html); win.document.close();
 }
 
 function renderRows(view, rows) {
@@ -331,6 +623,8 @@ function renderQuotationPanel(data) {
   state.quotationDefaults = {
     companyName: data.default_company_name || '',
     senderAddress: data.default_sender_address || '',
+    senderContact: data.default_sender_contact || '',
+    senderPhone: data.default_sender_phone || '',
   };
   $('#content').insertAdjacentHTML('beforeend', `
     <section class="quotation-section">
@@ -345,6 +639,8 @@ function renderQuotationPanel(data) {
     state.quotationDefaults = {
       companyName: result.default_company_name || '',
       senderAddress: result.default_sender_address || '',
+      senderContact: result.default_sender_contact || '',
+      senderPhone: result.default_sender_phone || '',
     };
     renderQuotationTable(result.items);
   };
@@ -366,6 +662,8 @@ function renderDeliveryPanel(data) {
   state.deliveryDefaults = {
     shippingUnit: data.default_shipping_unit || '',
     senderAddress: data.default_sender_address || '',
+    senderContact: data.default_sender_contact || '',
+    senderPhone: data.default_sender_phone || '',
   };
   $('#content').insertAdjacentHTML('beforeend', `
     <section class="quotation-section">
@@ -376,15 +674,21 @@ function renderDeliveryPanel(data) {
   renderDeliveryTable(data.items);
   $('#deliverySearchBtn').onclick = async () => {
     const result = await api(`/api/delivery-notes?q=${encodeURIComponent($('#deliverySearch').value)}`);
-    state.deliveryDefaults = { shippingUnit: result.default_shipping_unit || '', senderAddress: result.default_sender_address || '' };
+    state.deliveryDefaults = { shippingUnit: result.default_shipping_unit || '', senderAddress: result.default_sender_address || '',
+      senderContact: result.default_sender_contact || '', senderPhone: result.default_sender_phone || '' };
     renderDeliveryTable(result.items);
   };
 }
 
 function renderDeliveryTable(rows) {
-  const cols = [['note_no','发货单号'],['order_no','销售单号'],['delivery_date','发货日期'],['receiving_unit','收货单位'],['item_count','备件项数'],['total_quantity','发货数量'],['status_text','状态']];
-  rows.forEach(row => row.status_text = row.status === 'confirmed' ? '已确认出库' : '待确认');
-  $('#deliveryTableHolder').innerHTML = tableHtml(cols, rows, { actions: row => `
+  const displayRows = rows.map(row => ({
+    ...row,
+    status_text: row.status === 'confirmed' ? '已确认出库' : '待确认',
+    project_text: row.project_no || '未关联',
+    amount_text: money(row.amount),
+  }));
+  const cols = [['note_no','发货单号'],['order_no','销售单号'],['project_text','项目号'],['delivery_date','发货日期'],['receiving_unit','收货单位'],['item_count','备件项数'],['total_quantity','发货数量'],['amount_text','金额'],['status_text','状态']];
+  $('#deliveryTableHolder').innerHTML = tableHtml(cols, displayRows, { actions: row => `
     <button onclick='viewDeliveryNote(${JSON.stringify(row)})'>查看</button>
     <button onclick='printDeliveryNote(${JSON.stringify(row)})'>打印发货单</button>
     ${row.status === 'draft' ? `<button class="primary" onclick='confirmDeliveryNote(${row.id})'>确认发货</button>` : ''}
@@ -417,11 +721,13 @@ async function openDeliveryForm(order) {
   await refreshLookups();
   const customer = state.customers.find(item => Number(item.id) === Number(order.customer_id)) || {};
   const today = new Date().toISOString().slice(0, 10);
+  const availableProjects = state.projects.filter(item => item.status === 'active' && Number(item.customer_id) === Number(order.customer_id));
   $('#modalTitle').textContent = `新增发货单：${order.order_no}`;
   const form = $('#modalForm');
   form.innerHTML = `
     <label>发货单号<input name="note_no" placeholder="留空自动生成"></label>
     <label>销售单号<input value="${order.order_no}" readonly></label>
+    <label class="wide">关联项目（可选）<select name="project_id"><option value="">不关联项目</option>${availableProjects.map(item => `<option value="${item.id}">${escapeHtml(item.project_no)} - ${escapeHtml(item.name)}</option>`).join('')}</select></label>
     <label>发货日期<input name="delivery_date" type="date" value="${today}" required></label>
     <label>发货方式<input name="delivery_method" placeholder="例如：快递、物流、自提"></label>
     <div class="wide form-section-title">收货方信息</div>
@@ -431,6 +737,8 @@ async function openDeliveryForm(order) {
     <label class="wide">收货地址<input name="receiver_address" value="${customer.address || ''}"></label>
     <div class="wide form-section-title">发货方信息</div>
     <label>发货单位<input name="shipping_unit" value="${state.deliveryDefaults.shippingUnit || ''}" required></label>
+    <label>发货联系人<input name="sender_contact" value="${state.deliveryDefaults.senderContact || ''}"></label>
+    <label>发货联系电话<input name="sender_phone" value="${state.deliveryDefaults.senderPhone || ''}"></label>
     <label class="wide">发货地址<input name="sender_address" value="${state.deliveryDefaults.senderAddress || ''}"></label>
     <label class="wide">备注<textarea name="remark"></textarea></label>
     <div class="wide order-lines-head"><h3>本次发货明细</h3><span>只显示销售订单未发数量</span></div>
@@ -463,13 +771,13 @@ function deliveryItemsTable(row) {
 
 function viewDeliveryNote(row) {
   $('#modalTitle').textContent = `发货单 ${row.note_no}`;
-  $('#modalForm').innerHTML = `<div class="wide order-summary"><strong>${row.note_no}</strong><span>销售单：${row.order_no}</span><span>发货日期：${row.delivery_date}</span><span>状态：${row.status === 'confirmed' ? '已确认出库' : '待确认'}</span></div><div class="wide shipping-summary"><strong>收货方信息</strong><span>收货单位：${row.receiving_unit}</span><span>联系人：${row.receiver_contact || '-'}</span><span>电话：${row.receiver_phone || '-'}</span><span>地址：${row.receiver_address || '-'}</span></div><div class="wide shipping-summary"><strong>发货方信息</strong><span>发货单位：${row.shipping_unit}</span><span>发货地址：${row.sender_address || '-'}</span><span>发货方式：${row.delivery_method || '-'}</span></div><div class="wide">${deliveryItemsTable(row)}</div><div class="form-actions"><button type="button" id="cancelBtn">关闭</button><button type="button" class="primary" id="printDeliveryBtn">打印发货单</button></div>`;
+  $('#modalForm').innerHTML = `<div class="wide order-summary"><strong>${row.note_no}</strong><span>销售单：${row.order_no}</span><span>项目：${row.project_no || '未关联'}</span><span>发货日期：${row.delivery_date}</span><span>状态：${row.status === 'confirmed' ? '已确认出库' : '待确认'}</span></div><div class="wide shipping-summary"><strong>收货方信息</strong><span>收货单位：${row.receiving_unit}</span><span>联系人：${row.receiver_contact || '-'}</span><span>电话：${row.receiver_phone || '-'}</span><span>地址：${row.receiver_address || '-'}</span></div><div class="wide shipping-summary"><strong>发货方信息</strong><span>发货联系人：${row.sender_contact || '-'}</span><span>联系电话：${row.sender_phone || '-'}</span><span>发货地址：${row.sender_address || '-'}</span><span>发货方式：${row.delivery_method || '-'}</span></div><div class="wide">${deliveryItemsTable(row)}</div><div class="form-actions"><button type="button" id="cancelBtn">关闭</button><button type="button" class="primary" id="printDeliveryBtn">打印发货单</button></div>`;
   $('#modal').classList.remove('hidden'); $('#cancelBtn').onclick = closeModal; $('#printDeliveryBtn').onclick = () => printDeliveryNote(row);
 }
 
 function printDeliveryNote(row) {
   const itemRows = row.items.map((item,index) => `<tr><td>${index+1}</td><td>${item.product_code}</td><td>${item.product_name}</td><td>${item.description || ''}</td><td>${item.unit || ''}</td><td>${item.quantity}</td><td>${item.remark || ''}</td></tr>`).join('');
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>发货单 ${row.note_no}</title><style>@page{size:A4;margin:16mm}body{font-family:Arial,"Microsoft YaHei";font-size:13px;color:#111}h1{text-align:center}.meta,.party{display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;border:1px solid #666;padding:10px;margin:10px 0}.party h2{grid-column:1/-1;font-size:15px;margin:0}.wide{grid-column:1/-1}table{width:100%;border-collapse:collapse}th,td{border:1px solid #555;padding:8px}th{background:#eee}.footer{display:flex;justify-content:space-between;margin-top:40px}</style></head><body><h1>发 货 单</h1><div class="meta"><span>发货单号：${row.note_no}</span><span>销售单号：${row.order_no}</span><span>发货日期：${row.delivery_date}</span><span>发货方式：${row.delivery_method || '-'}</span></div><div class="party"><h2>收货方信息</h2><span>收货单位：${row.receiving_unit}</span><span>收货联系人：${row.receiver_contact || '-'}</span><span>联系电话：${row.receiver_phone || '-'}</span><span class="wide">收货地址：${row.receiver_address || '-'}</span></div><div class="party"><h2>发货方信息</h2><span>发货单位：${row.shipping_unit}</span><span class="wide">发货地址：${row.sender_address || '-'}</span></div><table><thead><tr><th>序号</th><th>备件编号</th><th>产品名称</th><th>技术描述</th><th>单位</th><th>发货数量</th><th>备注</th></tr></thead><tbody>${itemRows}</tbody></table><p><strong>备注：</strong>${row.remark || '无'}</p><div class="footer"><span>发货人：${row.created_by || ''}</span><span>收货确认：________________</span></div><script>window.print()</script></body></html>`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>发货单 ${row.note_no}</title><style>@page{size:A4;margin:16mm}body{font-family:Arial,"Microsoft YaHei";font-size:13px;color:#111}h1{text-align:center}.meta,.party{display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;border:1px solid #666;padding:10px;margin:10px 0}.party h2{grid-column:1/-1;font-size:15px;margin:0}.wide{grid-column:1/-1}table{width:100%;border-collapse:collapse}th,td{border:1px solid #555;padding:8px}th{background:#eee}.footer{display:flex;justify-content:space-between;margin-top:40px}</style></head><body><h1>发 货 单</h1><div class="meta"><span>发货单号：${row.note_no}</span><span>销售单号：${row.order_no}</span><span>发货日期：${row.delivery_date}</span><span>发货方式：${row.delivery_method || '-'}</span></div><div class="party"><h2>收货方信息</h2><span>收货单位：${row.receiving_unit}</span><span>收货联系人：${row.receiver_contact || '-'}</span><span>联系电话：${row.receiver_phone || '-'}</span><span class="wide">收货地址：${row.receiver_address || '-'}</span></div><div class="party"><h2>发货方信息</h2><span>发货单位：${row.shipping_unit || '-'}</span><span>发货联系人：${row.sender_contact || '-'}</span><span>联系电话：${row.sender_phone || '-'}</span><span class="wide">发货地址：${row.sender_address || '-'}</span></div><table><thead><tr><th>序号</th><th>备件编号</th><th>产品名称</th><th>技术描述</th><th>单位</th><th>发货数量</th><th>备注</th></tr></thead><tbody>${itemRows}</tbody></table><p><strong>备注：</strong>${row.remark || '无'}</p><div class="footer"><span>发货人：${row.created_by || ''}</span><span>收货确认：________________</span></div><script>window.print()</script></body></html>`;
   const win = window.open('', '_blank'); win.document.write(html); win.document.close();
 }
 
@@ -599,6 +907,8 @@ async function openQuotationForm(row = null) {
   const today = new Date().toISOString().slice(0, 10);
   const companyName = row?.own_company_name || state.quotationDefaults.companyName || '';
   const senderAddress = row?.sender_address || state.quotationDefaults.senderAddress || '';
+  const senderContact = row?.sender_contact || state.quotationDefaults.senderContact || '';
+  const senderPhone = row?.sender_phone || state.quotationDefaults.senderPhone || '';
   const validDate = new Date();
   validDate.setDate(validDate.getDate() + 30);
   $('#modalTitle').textContent = row ? `修改报价单 ${row.quote_no}` : '新增报价单';
@@ -615,6 +925,8 @@ async function openQuotationForm(row = null) {
     <div class="wide form-section-title">发货方信息</div>
     <label>我方公司名称<input name="own_company_name" value="${companyName}" required></label>
     <label>发货单位<input name="shipping_unit" value="${row?.shipping_unit || companyName}" required></label>
+    <label>发货联系人<input name="sender_contact" value="${senderContact}"></label>
+    <label>发货联系电话<input name="sender_phone" value="${senderPhone}"></label>
     <label class="wide">发货地址<input name="sender_address" value="${senderAddress}" required placeholder="首次手工填写，后续报价单自动沿用"></label>
     <label>预计交货日期<input name="delivery_date" type="date" value="${row?.delivery_date || ''}"></label>
     <label>发货方式<input name="delivery_method" value="${row?.delivery_method || ''}" placeholder="例如：快递、物流、自提"></label>
@@ -676,7 +988,7 @@ function viewQuotation(row) {
   $('#modalForm').innerHTML = `
     <div class="wide order-summary"><strong>${row.quote_no}</strong><span>报价日期：${row.quote_date}</span><span>有效期至：${row.validity_date || '-'}</span></div>
     <div class="wide shipping-summary"><strong>收货方信息</strong><span>客户 / 收货单位：${row.customer_name}</span><span>收货联系人：${row.shipping_contact || '-'}</span><span>联系电话：${row.shipping_phone || '-'}</span><span>收货地址：${row.shipping_address || '-'}</span></div>
-    <div class="wide shipping-summary"><strong>发货方信息</strong><span>我方公司：${row.own_company_name}</span><span>发货单位：${row.shipping_unit}</span><span>发货地址：${row.sender_address || '-'}</span><span>交货日期：${row.delivery_date || '-'}</span><span>发货方式：${row.delivery_method || '-'}</span></div>
+    <div class="wide shipping-summary"><strong>发货方信息</strong><span>我方公司：${row.own_company_name}</span><span>发货联系人：${row.sender_contact || '-'}</span><span>联系电话：${row.sender_phone || '-'}</span><span>发货地址：${row.sender_address || '-'}</span><span>交货日期：${row.delivery_date || '-'}</span><span>发货方式：${row.delivery_method || '-'}</span></div>
     <div class="wide">${quotationItemsTable(row)}</div>
     <div class="wide order-total">报价合计：<strong>${money(row.amount)}</strong></div>
     <div class="form-actions"><button type="button" id="cancelBtn">关闭</button><button type="button" class="primary" id="printQuoteBtn">打印报价单</button></div>`;
@@ -692,7 +1004,7 @@ function printQuotation(row) {
   </style></head><body><h1>报 价 单</h1><div class="company">${row.own_company_name}</div>
   <div class="meta"><span>报价单号：${row.quote_no}</span><span>报价日期：${row.quote_date}</span><span>报价有效期至：${row.validity_date || '-'}</span></div>
   <div class="shipping"><h2>收货方信息</h2><span>客户 / 收货单位：${row.customer_name}</span><span>收货联系人：${row.shipping_contact || '-'}</span><span>联系电话：${row.shipping_phone || '-'}</span><span class="wide">收货地址：${row.shipping_address || '-'}</span></div>
-  <div class="shipping"><h2>发货方信息</h2><span>我方公司：${row.own_company_name}</span><span>发货单位：${row.shipping_unit}</span><span>预计交货日期：${row.delivery_date || '-'}</span><span>发货方式：${row.delivery_method || '-'}</span><span class="wide">发货地址：${row.sender_address || '-'}</span></div>
+  <div class="shipping"><h2>发货方信息</h2><span>我方公司：${row.own_company_name}</span><span>发货联系人：${row.sender_contact || '-'}</span><span>联系电话：${row.sender_phone || '-'}</span><span>预计交货日期：${row.delivery_date || '-'}</span><span>发货方式：${row.delivery_method || '-'}</span><span class="wide">发货地址：${row.sender_address || '-'}</span></div>
   <table><thead><tr><th>序号</th><th>备件编号</th><th>产品名称</th><th>技术描述</th><th>单位</th><th>数量</th><th>单价</th><th>金额</th><th>备注</th></tr></thead><tbody>${itemRows}</tbody></table>
   <div class="total">报价总金额：￥${money(row.amount)}</div><div class="remark"><strong>报价及发货备注：</strong>${row.remark || '无'}</div>
   <div class="footer"><span>报价人：${row.created_by || ''}</span><span>客户确认：________________</span></div><script>window.print()</script></body></html>`;
@@ -908,10 +1220,12 @@ function selectHtml(name, label, items, value, req, showStock = false) {
 }
 
 async function openForm(view, row = null) {
-  if (['purchases', 'sales', 'stockManual'].includes(view)) await refreshLookups();
-  $('#modalTitle').textContent = row ? `修改${titles[view][0]}` : `新增${titles[view]?.[0] || '数据'}`;
+  if (['purchases', 'sales', 'stockManual', 'projects'].includes(view)) await refreshLookups();
+  const formTitle = view === 'projects' ? '项目' : (titles[view]?.[0] || '数据');
+  $('#modalTitle').textContent = row ? `修改${formTitle}` : `新增${formTitle}`;
   const form = $('#modalForm');
-  form.innerHTML = forms[view].map(field => inputHtml(field, row || {})).join('') +
+  const formData = row || (view === 'projects' ? { start_date: new Date().toISOString().slice(0, 10) } : {});
+  form.innerHTML = forms[view].map(field => inputHtml(field, formData)).join('') +
     `<div class="form-actions"><button type="button" id="cancelBtn">取消</button><button class="primary" type="submit">保存</button></div>`;
   $('#modal').classList.remove('hidden');
   $('#cancelBtn').onclick = closeModal;
@@ -970,7 +1284,11 @@ async function saveForm(event, view, row) {
   try {
     const result = await api(url, { method, headers, body });
     closeModal();
-    showMessage(result.order_no ? `保存成功，单号：${result.order_no}` : '保存成功', true);
+    showMessage(result.order_no ? `保存成功，单号：${result.order_no}` : (result.project_no ? `项目保存成功：${result.project_no}` : '保存成功'), true);
+    if (view === 'projects') {
+      $('#pageTitle').textContent = titles.projects[0];
+      $('#pageSubTitle').textContent = titles.projects[1];
+    }
     await loadView();
   } catch (error) {
     showMessage(error.message);
@@ -1082,7 +1400,7 @@ async function openSupplierAttachments(supplierId, supplierName) {
   }
 }
 
-function openAttachmentPreview(attachmentId, fileName, fileType) {
+function openAttachmentPreview(attachmentId, fileName, fileType, urlPrefix = '/api/attachments') {
   let layer = $('#attachmentPreview');
   if (!layer) {
     document.body.insertAdjacentHTML('beforeend', `
@@ -1097,7 +1415,7 @@ function openAttachmentPreview(attachmentId, fileName, fileType) {
     layer.onclick = event => { if (event.target === layer) closeAttachmentPreview(); };
   }
   $('#attachmentPreviewTitle').textContent = fileName;
-  const url = `/api/attachments/${attachmentId}/view`;
+  const url = `${urlPrefix}/${attachmentId}/view`;
   $('#attachmentPreviewBody').innerHTML = fileType === 'pdf'
     ? `<iframe class="attachment-pdf" src="${url}" title="${fileName}"></iframe>`
     : `<img class="attachment-full-image" src="${url}" alt="${fileName}">`;
@@ -1144,6 +1462,7 @@ async function loadView() {
     if (state.view === 'dashboard') await renderDashboard();
     else if (['suppliers', 'customers', 'products'].includes(state.view)) await renderCrud(state.view);
     else if (['purchases', 'sales'].includes(state.view)) await renderOrders(state.view);
+    else if (state.view === 'projects') await renderProjects();
     else if (state.view === 'stock') await renderStock();
     else if (state.view === 'stats') await renderStats();
     else if (['users', 'logs'].includes(state.view)) await renderSimple(state.view);
